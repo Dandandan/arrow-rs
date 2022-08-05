@@ -456,13 +456,7 @@ fn dict_array_value_to_string<K: ArrowPrimitiveType>(
         return Ok(String::from(""));
     }
 
-    let dict_index = keys_array.value(row).to_usize().ok_or_else(|| {
-        ArrowError::InvalidArgumentError(format!(
-            "Can not convert value {:?} at index {:?} to usize for string conversion.",
-            keys_array.value(row),
-            row
-        ))
-    })?;
+    let dict_index = keys_array.value(row).try_to_usize()?;
 
     array_value_to_string(dict_array.values(), dict_index)
 }

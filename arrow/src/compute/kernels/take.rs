@@ -329,13 +329,6 @@ pub struct TakeOptions {
     pub check_bounds: bool,
 }
 
-#[inline(always)]
-fn maybe_usize<I: ArrowNativeType>(index: I) -> Result<usize> {
-    index
-        .to_usize()
-        .ok_or_else(|| ArrowError::ComputeError("Cast to usize failed".to_string()))
-}
-
 // take implementation when neither values nor indices contain nulls
 fn take_no_nulls<T, I>(values: &[T], indices: &[I]) -> Result<(Buffer, Option<Buffer>)>
 where
@@ -344,7 +337,7 @@ where
 {
     let values = indices
         .iter()
-        .map(|index| Result::Ok(values[maybe_usize::<I>(*index)?]));
+        .map(|index| Result::Ok(values[index.try_to_usize()?]));
     // Soundness: `slice.map` is `TrustedLen`.
     let buffer = unsafe { Buffer::try_from_trusted_len_iter(values)? };
 
@@ -378,7 +371,7 @@ where
     let mut null_count = 0;
 
     let values = indices.iter().enumerate().map(|(i, index)| {
-        let index = maybe_usize::<I>(*index)?;
+        let index = index.try_to_usize()?;
         if values_data.is_null(index) {
             null_count += 1;
             bit_util::unset_bit(null_slice, i);
@@ -421,7 +414,7 @@ where
     I: ArrowNativeType,
 {
     let values = indices.iter().map(|index| {
-        let index = maybe_usize::<I>(*index)?;
+        let index = index.try_to_usize()?;
         Result::Ok(match values.get(index) {
             Some(value) => *value,
             None => {
@@ -484,7 +477,7 @@ where
             bit_util::unset_bit(null_slice, i);
             Ok(T::default())
         } else {
-            let index = maybe_usize::<I>(index)?;
+            let index = index.try_to_usize()?;
             if values_data.is_null(index) {
                 null_count += 1;
                 bit_util::unset_bit(null_slice, i);
@@ -908,7 +901,7 @@ where
         .values()
         .iter()
         .map(|idx| {
-            let idx = maybe_usize::<IndexType::Native>(*idx)?;
+            let idx = idx.try_to_usize()?;
             if data_ref.is_valid(idx) {
                 Ok(Some(values.value(idx)))
             } else {
@@ -934,7 +927,7 @@ where
         .values()
         .iter()
         .map(|idx| {
-            let idx = maybe_usize::<IndexType::Native>(*idx)?;
+            let idx = idx.try_to_usize()?;
             if data_ref.is_valid(idx) {
                 Ok(Some(values.value(idx)))
             } else {

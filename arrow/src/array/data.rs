@@ -808,19 +808,9 @@ impl ArrayData {
             return Ok(());
         }
 
-        let first_offset = offsets[0].to_usize().ok_or_else(|| {
-            ArrowError::InvalidArgumentError(format!(
-                "Error converting offset[0] ({}) to usize for {}",
-                offsets[0], self.data_type
-            ))
-        })?;
+        let first_offset = offsets[0].try_to_usize()?;
 
-        let last_offset = offsets[self.len].to_usize().ok_or_else(|| {
-            ArrowError::InvalidArgumentError(format!(
-                "Error converting offset[{}] ({}) to usize for {}",
-                self.len, offsets[self.len], self.data_type
-            ))
-        })?;
+        let last_offset = offsets[self.len].try_to_usize()?;
 
         if first_offset > values_length {
             return Err(ArrowError::InvalidArgumentError(format!(
@@ -1113,11 +1103,7 @@ impl ArrayData {
             .enumerate()
             .map(|(i, x)| {
                 // check if the offset can be converted to usize
-                let r = x.to_usize().ok_or_else(|| {
-                    ArrowError::InvalidArgumentError(format!(
-                        "Offset invariant failure: Could not convert offset {} to usize at position {}",
-                        x, i))}
-                    );
+                let r = x.try_to_usize();
                 // check if the offset exceeds the limit
                 match r {
                     Ok(n) if n <= offset_limit => Ok((i, n)),

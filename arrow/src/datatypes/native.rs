@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::error::{ArrowError, Result};
+
 use super::DataType;
 use half::f16;
 use serde_json::{Number, Value};
@@ -95,6 +97,12 @@ pub trait ArrowNativeType:
     #[inline]
     fn from_i128(_: i128) -> Option<Self> {
         None
+    }
+
+    #[inline]
+    fn try_to_usize(&self) -> Result<usize> {
+        self.to_usize()
+            .ok_or_else(|| ArrowError::ComputeError("Cast to usize failed".to_string()))
     }
 }
 
