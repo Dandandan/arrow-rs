@@ -978,22 +978,22 @@ impl<T: ArrowPrimitiveType> PrimitiveArray<T> {
         let len = self.len();
 
         let nulls = self.nulls().cloned();
-        let mut buffer = BufferBuilder::<O::Native>::new(len);
-        buffer.append_n_zeroed(len);
-        let slice = buffer.as_slice_mut();
 
-        let f = |idx| {
-            unsafe { *slice.get_unchecked_mut(idx) = op(self.value_unchecked(idx))? };
-            Ok::<_, E>(())
-        };
-
-        match &nulls {
-            Some(nulls) => nulls.try_for_each_valid_idx(f)?,
-            None => (0..len).try_for_each(f)?,
+        match nulls.filter(|x| x.null_count() > 0) {
+            Some(nulls) => {
+                let values: Result<Vec<O::Native>, E> = nulls
+                    .valid_indices()
+                    .map(|i| op(unsafe { self.value_unchecked(i) }))
+                    .collect();
+                return Ok(PrimitiveArray::new(values?.into(), Some(nulls)));
+            }
+            None => {
+                let values: Result<Vec<O::Native>, E> = (0..len)
+                    .map(|i| op(unsafe { self.value_unchecked(i) }))
+                    .collect();
+                return Ok(PrimitiveArray::new(values?.into(), None));
+            }
         }
-
-        let values = buffer.finish().into();
-        Ok(PrimitiveArray::new(values, nulls))
     }
 
     /// Applies a unary fallible function to all valid values in a mutable
