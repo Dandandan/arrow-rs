@@ -290,6 +290,16 @@ impl ByteViewArrayDecoder {
 }
 
 /// Decoder from [`Encoding::PLAIN`] data to [`ViewBuffer`]
+#[inline(always)]
+unsafe fn read_inlined<const LEN: usize>(buf: &[u8], offset: usize) -> u128 {
+    // The first 4 bytes of the view is the length, followed by the inlined string
+    let mut view_bytes = [0; 16];
+    view_bytes[0..4].copy_from_slice(&(LEN as u32).to_le_bytes());
+    let ptr = buf.as_ptr().add(offset);
+    std::ptr::copy_nonoverlapping(ptr, view_bytes.as_mut_ptr().add(4), LEN);
+    u128::from_le_bytes(view_bytes)
+}
+
 pub struct ByteViewArrayDecoderPlain {
     buf: Buffer,
     offset: usize,
@@ -386,8 +396,30 @@ impl ByteViewArrayDecoderPlain {
                 }
             }
 
-            unsafe {
-                output.append_view_unchecked(block_id, start_offset as u32, len);
+            if len <= 12 {
+                let view = unsafe {
+                    match len {
+                        0 => 0,
+                        1 => read_inlined::<1>(buf, start_offset),
+                        2 => read_inlined::<2>(buf, start_offset),
+                        3 => read_inlined::<3>(buf, start_offset),
+                        4 => read_inlined::<4>(buf, start_offset),
+                        5 => read_inlined::<5>(buf, start_offset),
+                        6 => read_inlined::<6>(buf, start_offset),
+                        7 => read_inlined::<7>(buf, start_offset),
+                        8 => read_inlined::<8>(buf, start_offset),
+                        9 => read_inlined::<9>(buf, start_offset),
+                        10 => read_inlined::<10>(buf, start_offset),
+                        11 => read_inlined::<11>(buf, start_offset),
+                        12 => read_inlined::<12>(buf, start_offset),
+                        _ => unreachable!(),
+                    }
+                };
+                unsafe { output.append_raw_view_unchecked(&view) };
+            } else {
+                unsafe {
+                    output.append_view_unchecked(block_id, start_offset as u32, len);
+                }
             }
             self.offset = end_offset;
             read += 1;
