@@ -280,11 +280,22 @@ where
         }
     };
 
-    // start and end offsets of all substrings
-    let mut new_starts_ends: Vec<(T::Offset, T::Offset)> = Vec::with_capacity(array.len());
+    // Optimization:
+    //
+    // Previously this was implemented as two loops:
+    //
+    // 1. Calculate the start and end offsets of all substrings and store them
+    //    in a temporary `Vec<(T::Offset, T::Offset)>`
+    // 2. Iterate the temporary `Vec` and copy the substrings into a result buffer
+    //
+    // This has been optimized to a single loop that calculates the start and
+    // end offsets of the substring, and immediately copies it to the result buffer.
+    //
+    // This avoids the intermediate allocation, and improves data locality.
     let mut new_offsets: Vec<T::Offset> = Vec::with_capacity(array.len() + 1);
-    let mut len_so_far = zero;
     new_offsets.push(zero);
+    // Rough estimation of buffer size
+    let mut new_values = MutableBuffer::new(data.len());
 
     offsets
         .windows(2)
@@ -298,23 +309,12 @@ where
                 Some(length) => check_char_boundary((length + new_start).min(pair[1]))?,
                 None => pair[1],
             };
-            len_so_far += new_end - new_start;
-            new_starts_ends.push((new_start, new_end));
-            new_offsets.push(len_so_far);
+            let new_start = new_start.as_usize();
+            let new_end = new_end.as_usize();
+            new_values.extend_from_slice(&data[new_start..new_end]);
+            new_offsets.push(T::Offset::from_usize(new_values.len()).unwrap());
             Ok(())
         })?;
-
-    // concatenate substrings into a buffer
-    let mut new_values = MutableBuffer::new(new_offsets.last().unwrap().as_usize());
-
-    new_starts_ends
-        .iter()
-        .map(|(start, end)| {
-            let start = start.as_usize();
-            let end = end.as_usize();
-            &data[start..end]
-        })
-        .for_each(|slice| new_values.extend_from_slice(slice));
 
     let data = unsafe {
         ArrayData::new_unchecked(
