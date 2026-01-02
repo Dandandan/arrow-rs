@@ -197,17 +197,33 @@ pub fn substring_by_char<OffsetSize: OffsetSizeTrait>(
     });
     let mut new_offsets = BufferBuilder::<OffsetSize>::new(array.len() + 1);
     new_offsets.append(OffsetSize::zero());
-    let length = length.map(|len| len.to_usize().unwrap());
 
     array.iter().for_each(|val| {
         if let Some(val) = val {
-            let char_count = val.chars().count();
-            let start = if start >= 0 {
-                start.to_usize().unwrap()
+            let (start_offset, end_offset) = if start >= 0 {
+                // Optimized path for positive start: one pass, no allocation
+                let mut iter = val.char_indices();
+                let start_byte = iter.nth(start as usize).map_or(val.len(), |(i, _)| i);
+
+                let end_byte = match length.map(|l| l as usize) {
+                    Some(0) => start_byte,
+                    Some(l) => iter.nth(l - 1).map_or(val.len(), |(i, _)| i),
+                    None => val.len(),
+                };
+                (start_byte, end_byte)
             } else {
-                char_count - (-start).to_usize().unwrap().min(char_count)
+                // Slower path for negative start: one pass + one allocation
+                let indices: Vec<usize> = val.char_indices().map(|(i, _)| i).collect();
+                let count = indices.len();
+                let start_idx = count - std::cmp::min((-start) as usize, count);
+
+                let start_byte = *indices.get(start_idx).unwrap_or(&val.len());
+                let end_byte = match length.map(|l| l as usize) {
+                    Some(l) => *indices.get(start_idx + l).unwrap_or(&val.len()),
+                    None => val.len(),
+                };
+                (start_byte, end_byte)
             };
-            let (start_offset, end_offset) = get_start_end_offset(val, start, length);
             vals.append_slice(&val.as_bytes()[start_offset..end_offset]);
         }
         new_offsets.append(OffsetSize::from_usize(vals.len()).unwrap());
@@ -224,29 +240,6 @@ pub fn substring_by_char<OffsetSize: OffsetSizeTrait>(
         )
     };
     Ok(GenericStringArray::<OffsetSize>::from(data))
-}
-
-/// * `val` - string
-/// * `start` - the start char index of the substring
-/// * `length` - the char length of the substring
-///
-/// Return the `start` and `end` offset (by byte) of the substring
-fn get_start_end_offset(val: &str, start: usize, length: Option<usize>) -> (usize, usize) {
-    let len = val.len();
-    let mut offset_char_iter = val.char_indices();
-    let start_offset = offset_char_iter
-        .nth(start)
-        .map_or(len, |(offset, _)| offset);
-    let end_offset = length.map_or(len, |length| {
-        if length > 0 {
-            offset_char_iter
-                .nth(length - 1)
-                .map_or(len, |(offset, _)| offset)
-        } else {
-            start_offset
-        }
-    });
-    (start_offset, end_offset)
 }
 
 fn byte_substring<T: ByteArrayType>(
