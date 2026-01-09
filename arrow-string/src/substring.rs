@@ -201,10 +201,11 @@ pub fn substring_by_char<OffsetSize: OffsetSizeTrait>(
 
     array.iter().for_each(|val| {
         if let Some(val) = val {
-            let char_count = val.chars().count();
+            // Defer expensive char_count until it's needed for negative start indices
             let start = if start >= 0 {
                 start.to_usize().unwrap()
             } else {
+                let char_count = val.chars().count();
                 char_count - (-start).to_usize().unwrap().min(char_count)
             };
             let (start_offset, end_offset) = get_start_end_offset(val, start, length);
