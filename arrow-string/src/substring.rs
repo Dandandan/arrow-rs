@@ -201,13 +201,31 @@ pub fn substring_by_char<OffsetSize: OffsetSizeTrait>(
 
     array.iter().for_each(|val| {
         if let Some(val) = val {
-            let char_count = val.chars().count();
             let start = if start >= 0 {
                 start.to_usize().unwrap()
             } else {
+                // Slower path for negative start, avoiding overhead for the common case
+                let char_count = val.chars().count();
                 char_count - (-start).to_usize().unwrap().min(char_count)
             };
-            let (start_offset, end_offset) = get_start_end_offset(val, start, length);
+
+            let len = val.len();
+            let mut offset_char_iter = val.char_indices();
+
+            let start_offset = offset_char_iter
+                .nth(start)
+                .map_or(len, |(offset, _)| offset);
+
+            let end_offset = length.map_or(len, |length| {
+                if length > 0 {
+                    offset_char_iter
+                        .nth(length - 1)
+                        .map_or(len, |(offset, _)| offset)
+                } else {
+                    start_offset
+                }
+            });
+
             vals.append_slice(&val.as_bytes()[start_offset..end_offset]);
         }
         new_offsets.append(OffsetSize::from_usize(vals.len()).unwrap());
@@ -224,29 +242,6 @@ pub fn substring_by_char<OffsetSize: OffsetSizeTrait>(
         )
     };
     Ok(GenericStringArray::<OffsetSize>::from(data))
-}
-
-/// * `val` - string
-/// * `start` - the start char index of the substring
-/// * `length` - the char length of the substring
-///
-/// Return the `start` and `end` offset (by byte) of the substring
-fn get_start_end_offset(val: &str, start: usize, length: Option<usize>) -> (usize, usize) {
-    let len = val.len();
-    let mut offset_char_iter = val.char_indices();
-    let start_offset = offset_char_iter
-        .nth(start)
-        .map_or(len, |(offset, _)| offset);
-    let end_offset = length.map_or(len, |length| {
-        if length > 0 {
-            offset_char_iter
-                .nth(length - 1)
-                .map_or(len, |(offset, _)| offset)
-        } else {
-            start_offset
-        }
-    });
-    (start_offset, end_offset)
 }
 
 fn byte_substring<T: ByteArrayType>(
