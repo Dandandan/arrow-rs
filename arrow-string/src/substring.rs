@@ -201,13 +201,8 @@ pub fn substring_by_char<OffsetSize: OffsetSizeTrait>(
 
     array.iter().for_each(|val| {
         if let Some(val) = val {
-            let char_count = val.chars().count();
-            let start = if start >= 0 {
-                start.to_usize().unwrap()
-            } else {
-                char_count - (-start).to_usize().unwrap().min(char_count)
-            };
-            let (start_offset, end_offset) = get_start_end_offset(val, start, length);
+            let (start_offset, end_offset) =
+                get_start_end_offset_by_char(val, start, length.map(|v| v as i64));
             vals.append_slice(&val.as_bytes()[start_offset..end_offset]);
         }
         new_offsets.append(OffsetSize::from_usize(vals.len()).unwrap());
@@ -226,27 +221,76 @@ pub fn substring_by_char<OffsetSize: OffsetSizeTrait>(
     Ok(GenericStringArray::<OffsetSize>::from(data))
 }
 
-/// * `val` - string
-/// * `start` - the start char index of the substring
-/// * `length` - the char length of the substring
+/// Calculates the start and end byte offsets for a substring based on character indices.
 ///
-/// Return the `start` and `end` offset (by byte) of the substring
-fn get_start_end_offset(val: &str, start: usize, length: Option<usize>) -> (usize, usize) {
+/// * `val` - The string slice.
+/// * `start` - The starting character index. If negative, it counts from the end of the string.
+/// * `length` - The length of the substring in characters.
+///
+/// This function is optimized for negative `start` indices by using a two-iterator
+/// approach, which avoids an O(N) `chars().count()` scan.
+fn get_start_end_offset_by_char(
+    val: &str,
+    start: i64,
+    length: Option<i64>,
+) -> (usize, usize) {
     let len = val.len();
-    let mut offset_char_iter = val.char_indices();
-    let start_offset = offset_char_iter
-        .nth(start)
-        .map_or(len, |(offset, _)| offset);
-    let end_offset = length.map_or(len, |length| {
-        if length > 0 {
-            offset_char_iter
-                .nth(length - 1)
-                .map_or(len, |(offset, _)| offset)
-        } else {
-            start_offset
+
+    if start >= 0 {
+        let mut char_indices = val.char_indices();
+        // The start offset is the byte offset of the `start`-th character.
+        // `nth` consumes the iterator, leaving it at the character *after* the `start`-th one.
+        let start_offset = char_indices
+            .nth(start as usize)
+            .map_or(len, |(i, _)| i);
+
+        let end_offset = calculate_end_offset(char_indices, start_offset, length, len);
+        (start_offset, end_offset)
+    } else {
+        // For negative start, we use a two-iterator approach to find the
+        // start position from the end. This avoids an O(N) `chars().count()` scan.
+        let mut lead_iter = val.char_indices();
+        let mut tail_iter = val.char_indices();
+
+        // 1. Advance `lead_iter` by `abs(start)` characters.
+        for _ in 0..(-start) {
+            if lead_iter.next().is_none() {
+                // If `abs(start)` is >= character count, start is effectively 0.
+                tail_iter = val.char_indices();
+                break;
+            }
         }
-    });
-    (start_offset, end_offset)
+
+        // 2. Advance both iterators until `lead_iter` reaches the end.
+        // `tail_iter` will then be at the correct starting character.
+        while lead_iter.next().is_some() {
+            tail_iter.next();
+        }
+
+        // The `start_offset` is the byte offset of the character `tail_iter` points to.
+        let start_offset = tail_iter.clone().next().map_or(len, |(i, _)| i);
+        // We advance `tail_iter` by one to pass it to the helper for end_offset calculation.
+        tail_iter.next();
+        let end_offset = calculate_end_offset(tail_iter, start_offset, length, len);
+
+        (start_offset, end_offset)
+    }
+}
+
+/// Helper to calculate the end offset of a substring.
+fn calculate_end_offset(
+    mut iter: std::str::CharIndices<'_>,
+    start_offset: usize,
+    length: Option<i64>,
+    len: usize,
+) -> usize {
+    match length {
+        None => len,
+        Some(l) if l <= 0 => start_offset,
+        // `iter` is at the character *after* the start of the substring.
+        // So we need to advance `length - 1` more times to find the end.
+        Some(l) => iter.nth((l - 1) as usize).map_or(len, |(i, _)| i),
+    }
 }
 
 fn byte_substring<T: ByteArrayType>(
