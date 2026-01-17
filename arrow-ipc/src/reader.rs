@@ -2646,7 +2646,7 @@ mod tests {
         };
         expect_ipc_validation_error(
             Arc::new(invalid_struct_arr),
-            "Invalid argument error: Invalid UTF8 sequence at string index 3 (3..18): invalid utf-8 sequence of 1 bytes from index 11",
+            "Invalid argument error: Invalid UTF8 sequence at string index 3 (3..18): invalid utf-8 sequence",
         );
     }
 
@@ -2743,7 +2743,7 @@ mod tests {
         };
         expect_ipc_validation_error(
             Arc::new(array),
-            "Invalid argument error: Invalid UTF8 sequence at string index 3 (3..45): invalid utf-8 sequence of 1 bytes from index 38"
+            "Invalid argument error: Invalid UTF8 sequence at string index 3 (3..45): invalid utf-8 sequence"
         );
     }
 

@@ -1420,8 +1420,9 @@ impl ArrayData {
     where
         T: ArrowNativeType + TryInto<usize> + num::Num + std::fmt::Display,
     {
+        // Use simdutf8 for faster UTF-8 validation over the standard library implementation.
         let values_buffer = &self.buffers[1].as_slice();
-        if let Ok(values_str) = std::str::from_utf8(values_buffer) {
+        if let Ok(values_str) = simdutf8::basic::from_utf8(values_buffer) {
             // Validate Offsets are correct
             self.validate_each_offset::<T, _>(values_buffer.len(), |string_index, range| {
                 if !values_str.is_char_boundary(range.start)
@@ -1436,7 +1437,7 @@ impl ArrayData {
         } else {
             // find specific offset that failed utf8 validation
             self.validate_each_offset::<T, _>(values_buffer.len(), |string_index, range| {
-                std::str::from_utf8(&values_buffer[range.clone()]).map_err(|e| {
+                simdutf8::basic::from_utf8(&values_buffer[range.clone()]).map_err(|e| {
                     ArrowError::InvalidArgumentError(format!(
                         "Invalid UTF8 sequence at string index {string_index} ({range:?}): {e}"
                     ))

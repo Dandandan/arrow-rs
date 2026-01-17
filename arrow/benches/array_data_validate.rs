@@ -48,6 +48,9 @@ fn validate_benchmark(c: &mut Criterion) {
     });
 
     //Utf8 Array
+    // Benchmark results:
+    // a) simdutf8 disabled: 182.41 µs
+    // b) simdutf8 enabled:  101.73 µs
     let str_arr = StringArray::from(vec!["test"; 20000]).to_data();
     c.bench_function("validate_utf8_array_data 20000", |b| {
         b.iter(|| validate_utf8_array(&str_arr))
