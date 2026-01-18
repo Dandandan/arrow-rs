@@ -199,19 +199,27 @@ pub fn substring_by_char<OffsetSize: OffsetSizeTrait>(
     new_offsets.append(OffsetSize::zero());
     let length = length.map(|len| len.to_usize().unwrap());
 
-    array.iter().for_each(|val| {
-        if let Some(val) = val {
-            let char_count = val.chars().count();
-            let start = if start >= 0 {
-                start.to_usize().unwrap()
-            } else {
-                char_count - (-start).to_usize().unwrap().min(char_count)
-            };
-            let (start_offset, end_offset) = get_start_end_offset(val, start, length);
-            vals.append_slice(&val.as_bytes()[start_offset..end_offset]);
-        }
-        new_offsets.append(OffsetSize::from_usize(vals.len()).unwrap());
-    });
+    // Optimization: fast-path for start >= 0 to avoid expensive chars().count()
+    if start >= 0 {
+        let start = start.to_usize().unwrap();
+        array.iter().for_each(|val| {
+            if let Some(val) = val {
+                let (start_offset, end_offset) = get_start_end_offset(val, start, length);
+                vals.append_slice(&val.as_bytes()[start_offset..end_offset]);
+            }
+            new_offsets.append(OffsetSize::from_usize(vals.len()).unwrap());
+        });
+    } else {
+        array.iter().for_each(|val| {
+            if let Some(val) = val {
+                let char_count = val.chars().count();
+                let start = char_count - (-start).to_usize().unwrap().min(char_count);
+                let (start_offset, end_offset) = get_start_end_offset(val, start, length);
+                vals.append_slice(&val.as_bytes()[start_offset..end_offset]);
+            }
+            new_offsets.append(OffsetSize::from_usize(vals.len()).unwrap());
+        });
+    }
     let data = unsafe {
         ArrayData::new_unchecked(
             GenericStringArray::<OffsetSize>::DATA_TYPE,
