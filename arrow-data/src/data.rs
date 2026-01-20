@@ -1421,7 +1421,15 @@ impl ArrayData {
         T: ArrowNativeType + TryInto<usize> + num::Num + std::fmt::Display,
     {
         let values_buffer = &self.buffers[1].as_slice();
-        if let Ok(values_str) = std::str::from_utf8(values_buffer) {
+
+        #[cfg(feature = "simdutf8")]
+        let is_valid = simdutf8::basic::from_utf8(values_buffer).is_ok();
+        #[cfg(not(feature = "simdutf8"))]
+        let is_valid = std::str::from_utf8(values_buffer).is_ok();
+
+        if is_valid {
+            // This is safe because we just checked that it's valid UTF-8
+            let values_str = unsafe { std::str::from_utf8_unchecked(values_buffer) };
             // Validate Offsets are correct
             self.validate_each_offset::<T, _>(values_buffer.len(), |string_index, range| {
                 if !values_str.is_char_boundary(range.start)
