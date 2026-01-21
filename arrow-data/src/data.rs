@@ -1421,6 +1421,25 @@ impl ArrayData {
         T: ArrowNativeType + TryInto<usize> + num::Num + std::fmt::Display,
     {
         let values_buffer = &self.buffers[1].as_slice();
+        #[cfg(feature = "simdutf8")]
+        if let Ok(values_str) = simdutf8::basic::from_utf8(values_buffer) {
+            // SIMD UTF-8 validation succeeded, now check offsets are on char boundaries
+            return self.validate_each_offset::<T, _>(
+                values_buffer.len(),
+                |string_index, range| {
+                    if !values_str.is_char_boundary(range.start)
+                        || !values_str.is_char_boundary(range.end)
+                    {
+                        return Err(ArrowError::InvalidArgumentError(format!(
+                            "incomplete utf-8 byte sequence from index {string_index}"
+                        )));
+                    }
+                    Ok(())
+                },
+            );
+        }
+
+        // Fallback to standard library UTF-8 validation
         if let Ok(values_str) = std::str::from_utf8(values_buffer) {
             // Validate Offsets are correct
             self.validate_each_offset::<T, _>(values_buffer.len(), |string_index, range| {
