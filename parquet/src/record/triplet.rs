@@ -333,15 +333,19 @@ impl<T: DataType> TypedTripletIter<T> {
                 // the column reader method.
 
                 // Note: if values_read == 0, then spacing will not be triggered
-                let mut idx = values_read;
                 let def_levels = self.def_levels.as_ref().unwrap();
-                self.values.resize(levels_read, T::T::default());
-                for i in 0..levels_read {
-                    if def_levels[levels_read - i - 1] == self.max_def_level {
-                        idx -= 1; // This is done to avoid usize becoming a negative value
-                        self.values.swap(levels_read - i - 1, idx);
+                let old_values = std::mem::take(&mut self.values);
+                let mut values_iter = old_values.into_iter();
+
+                let mut values = Vec::with_capacity(levels_read);
+                for &level in &def_levels[..levels_read] {
+                    if level == self.max_def_level {
+                        values.push(values_iter.next().unwrap());
+                    } else {
+                        values.push(T::T::default());
                     }
                 }
+                self.values = values;
                 self.curr_triplet_index = 0;
                 self.triplets_left = levels_read;
             } else {
