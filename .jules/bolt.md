@@ -1,0 +1,3 @@
+## 2024-08-01 - SIMD-accelerated UTF-8 validation
+**Learning:** A significant performance gain (~45%) can be achieved in UTF-8 validation by replacing `std::str::from_utf8` with `simdutf8::basic::from_utf8`. The `simdutf8` crate leverages SIMD instructions for faster validation.
+**Action:** When profiling reveals UTF-8 validation as a bottleneck, consider using `simdutf8` as a fast-path. A fallback to the standard library's implementation should be maintained to ensure detailed error messages for compatibility with existing tests. Add `simdutf8` as an optional, default-on dependency to allow users to opt-out if needed.
