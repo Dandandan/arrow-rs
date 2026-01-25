@@ -1416,6 +1416,7 @@ impl ArrayData {
 
     /// Ensures that all strings formed by the offsets in `buffers[0]`
     /// into `buffers[1]` are valid utf8 sequences
+    #[cfg(not(feature = "simd"))]
     fn validate_utf8<T>(&self) -> Result<(), ArrowError>
     where
         T: ArrowNativeType + TryInto<usize> + num::Num + std::fmt::Display,
@@ -1434,6 +1435,43 @@ impl ArrayData {
                 Ok(())
             })
         } else {
+            // find specific offset that failed utf8 validation
+            self.validate_each_offset::<T, _>(values_buffer.len(), |string_index, range| {
+                std::str::from_utf8(&values_buffer[range.clone()]).map_err(|e| {
+                    ArrowError::InvalidArgumentError(format!(
+                        "Invalid UTF8 sequence at string index {string_index} ({range:?}): {e}"
+                    ))
+                })?;
+                Ok(())
+            })
+        }
+    }
+
+    /// Ensures that all strings formed by the offsets in `buffers[0]`
+    /// into `buffers[1]` are valid utf8 sequences
+    #[cfg(feature = "simd")]
+    fn validate_utf8<T>(&self) -> Result<(), ArrowError>
+    where
+        T: ArrowNativeType + TryInto<usize> + num::Num + std::fmt::Display,
+    {
+        let values_buffer = &self.buffers[1].as_slice();
+        if simdutf8::basic::from_utf8(values_buffer).is_ok() {
+            // simdutf8 validation succeeded, now check offsets are on char boundaries
+            // SAFETY: simdutf8 validation succeeded
+            let values_str = unsafe { std::str::from_utf8_unchecked(values_buffer) };
+            // Validate Offsets are correct
+            self.validate_each_offset::<T, _>(values_buffer.len(), |string_index, range| {
+                if !values_str.is_char_boundary(range.start)
+                    || !values_str.is_char_boundary(range.end)
+                {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "incomplete utf-8 byte sequence from index {string_index}"
+                    )));
+                }
+                Ok(())
+            })
+        } else {
+            // Fallback to std to get descriptive error messages
             // find specific offset that failed utf8 validation
             self.validate_each_offset::<T, _>(values_buffer.len(), |string_index, range| {
                 std::str::from_utf8(&values_buffer[range.clone()]).map_err(|e| {
