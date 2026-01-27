@@ -1421,6 +1421,33 @@ impl ArrayData {
         T: ArrowNativeType + TryInto<usize> + num::Num + std::fmt::Display,
     {
         let values_buffer = &self.buffers[1].as_slice();
+
+        #[cfg(feature = "simd")]
+        {
+            // simdutf8 is a faster UTF-8 validator, but doesn't provide as rich
+            // error messages as the standard library, which are checked by the
+            // existing test suite. As such, it is used as a fast path for valid
+            // UTF-8, falling back to the slower validation to generate the
+            // expected error messages
+            if simdutf8::basic::from_utf8(values_buffer).is_ok() {
+                // SAFETY: We have just validated this is valid UTF-8
+                let values_str = unsafe { std::str::from_utf8_unchecked(values_buffer) };
+                return self.validate_each_offset::<T, _>(
+                    values_buffer.len(),
+                    |string_index, range| {
+                        if !values_str.is_char_boundary(range.start)
+                            || !values_str.is_char_boundary(range.end)
+                        {
+                            return Err(ArrowError::InvalidArgumentError(format!(
+                                "incomplete utf-8 byte sequence from index {string_index}"
+                            )));
+                        }
+                        Ok(())
+                    },
+                );
+            }
+        }
+
         if let Ok(values_str) = std::str::from_utf8(values_buffer) {
             // Validate Offsets are correct
             self.validate_each_offset::<T, _>(values_buffer.len(), |string_index, range| {
