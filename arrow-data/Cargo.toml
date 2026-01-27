@@ -33,12 +33,14 @@ name = "arrow_data"
 bench = false
 
 [features]
+default = ["simd"]
 # force_validate runs full data validation for all arrays that are created
 # this is not enabled by default as it is too computationally expensive
 # but is run as part of our CI checks
 force_validate = []
 # Enable ffi support
 ffi = ["arrow-schema/ffi"]
+simd = ["dep:simdutf8"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -50,6 +52,7 @@ arrow-schema = { workspace = true }
 
 num = { version = "0.4", default-features = false, features = ["std"] }
 half = { version = "2.1", default-features = false }
+simdutf8 = { version = "0.1.4", optional = true }
 
 [dev-dependencies]
 
