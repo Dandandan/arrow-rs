@@ -1421,7 +1421,8 @@ impl ArrayData {
         T: ArrowNativeType + TryInto<usize> + num::Num + std::fmt::Display,
     {
         let values_buffer = &self.buffers[1].as_slice();
-        if let Ok(values_str) = std::str::from_utf8(values_buffer) {
+        // SIMD UTF-8 validation is significantly faster than the scalar version
+        if let Ok(values_str) = simdutf8::basic::from_utf8(values_buffer) {
             // Validate Offsets are correct
             self.validate_each_offset::<T, _>(values_buffer.len(), |string_index, range| {
                 if !values_str.is_char_boundary(range.start)

@@ -44,6 +44,7 @@ ffi = ["arrow-schema/ffi"]
 all-features = true
 
 [dependencies]
+simdutf8 = "0.1"
 
 arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }
