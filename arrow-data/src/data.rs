@@ -1421,6 +1421,28 @@ impl ArrayData {
         T: ArrowNativeType + TryInto<usize> + num::Num + std::fmt::Display,
     {
         let values_buffer = &self.buffers[1].as_slice();
+
+        // SIMD fast path
+        #[cfg(feature = "simd")]
+        if simdutf8::basic::from_utf8(values_buffer).is_ok() {
+            // The entire values buffer is valid UTF-8
+            //
+            // According to the arrow spec, the offsets buffer should be trusted.
+            // However, the rust implementation validates that the offsets fall
+            // on valid character boundaries.
+            let values_str = unsafe { std::str::from_utf8_unchecked(values_buffer) };
+            return self.validate_each_offset::<T, _>(values_buffer.len(), |string_index, range| {
+                if !values_str.is_char_boundary(range.start)
+                    || !values_str.is_char_boundary(range.end)
+                {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "incomplete utf-8 byte sequence from index {string_index}"
+                    )));
+                }
+                Ok(())
+            });
+        }
+
         if let Ok(values_str) = std::str::from_utf8(values_buffer) {
             // Validate Offsets are correct
             self.validate_each_offset::<T, _>(values_buffer.len(), |string_index, range| {
