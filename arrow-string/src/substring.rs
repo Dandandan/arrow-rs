@@ -201,13 +201,24 @@ pub fn substring_by_char<OffsetSize: OffsetSizeTrait>(
 
     array.iter().for_each(|val| {
         if let Some(val) = val {
-            let char_count = val.chars().count();
-            let start = if start >= 0 {
-                start.to_usize().unwrap()
+            let (start_offset, end_offset) = if val.is_ascii() {
+                let len = val.len();
+                let start = if start >= 0 {
+                    start.to_usize().unwrap().min(len)
+                } else {
+                    len.saturating_sub((-start) as usize)
+                };
+                let end = if let Some(l) = length {
+                    start.saturating_add(l).min(len)
+                } else {
+                    len
+                };
+                (start, end)
+            } else if start >= 0 {
+                get_start_end_offset(val, start.to_usize().unwrap(), length)
             } else {
-                char_count - (-start).to_usize().unwrap().min(char_count)
+                get_start_end_offset_rev(val, (-start).to_usize().unwrap(), length)
             };
-            let (start_offset, end_offset) = get_start_end_offset(val, start, length);
             vals.append_slice(&val.as_bytes()[start_offset..end_offset]);
         }
         new_offsets.append(OffsetSize::from_usize(vals.len()).unwrap());
@@ -246,6 +257,38 @@ fn get_start_end_offset(val: &str, start: usize, length: Option<usize>) -> (usiz
             start_offset
         }
     });
+    (start_offset, end_offset)
+}
+
+/// * `val` - string
+/// * `n` - the start char index of the substring from the end
+/// * `length` - the char length of the substring
+///
+/// Return the `start` and `end` offset (by byte) of the substring
+fn get_start_end_offset_rev(val: &str, n: usize, length: Option<usize>) -> (usize, usize) {
+    let len = val.len();
+    let mut rev_chars = val.chars().rev();
+
+    let mut bytes_from_end = 0;
+    let mut start_offset = 0;
+    let mut end_offset = len;
+
+    let end_n = length.map(|l| n.saturating_sub(l)).unwrap_or(0);
+
+    for i in 1..=n {
+        if let Some(c) = rev_chars.next() {
+            bytes_from_end += c.len_utf8();
+            if i == end_n {
+                end_offset = len - bytes_from_end;
+            }
+            if i == n {
+                start_offset = len - bytes_from_end;
+            }
+        } else {
+            // String is shorter than n, fallback to forward traversal
+            return get_start_end_offset(val, 0, length);
+        }
+    }
     (start_offset, end_offset)
 }
 
