@@ -118,14 +118,44 @@ impl<'a> Predicate<'a> {
             Predicate::StartsWith(v) => {
                 if let Some(string_view_array) = array.as_any().downcast_ref::<StringViewArray>() {
                     let nulls = string_view_array.logical_nulls();
-                    let values = BooleanBuffer::from(
-                        string_view_array
-                            .prefix_bytes_iter(v.len())
-                            .map(|haystack| {
-                                equals_bytes(haystack, v.as_bytes(), equals_kernel) != negate
-                            })
-                            .collect::<Vec<_>>(),
-                    );
+                    let prefix_bytes = v.as_bytes();
+                    let prefix_len = prefix_bytes.len();
+
+                    let (prefix_actual, mask) = if prefix_len > 0 {
+                        let mut p = [0u8; 4];
+                        let t_len = prefix_len.min(4);
+                        p[0..t_len].copy_from_slice(&prefix_bytes[0..t_len]);
+                        (
+                            u32::from_le_bytes(p),
+                            (1u64 << (t_len * 8)).wrapping_sub(1) as u32,
+                        )
+                    } else {
+                        (0, 0)
+                    };
+
+                    let values =
+                        BooleanBuffer::from_iter(string_view_array.views().iter().enumerate().map(
+                            |(idx, &v_u128)| {
+                                let len = v_u128 as u32 as usize;
+                                if len < prefix_len {
+                                    return negate;
+                                }
+
+                                if prefix_len > 0 {
+                                    let prefix_in_view = (v_u128 >> 32) as u32;
+                                    if (prefix_in_view & mask) != prefix_actual {
+                                        return negate;
+                                    }
+                                }
+
+                                if prefix_len <= 4 {
+                                    return !negate;
+                                }
+
+                                let haystack = unsafe { string_view_array.value_unchecked(idx) };
+                                haystack.starts_with(v) != negate
+                            },
+                        ));
                     BooleanArray::new(values, nulls)
                 } else {
                     BooleanArray::from_unary(array, |haystack| {
@@ -136,18 +166,16 @@ impl<'a> Predicate<'a> {
             Predicate::IStartsWithAscii(v) => {
                 if let Some(string_view_array) = array.as_any().downcast_ref::<StringViewArray>() {
                     let nulls = string_view_array.logical_nulls();
-                    let values = BooleanBuffer::from(
-                        string_view_array
-                            .prefix_bytes_iter(v.len())
-                            .map(|haystack| {
+                    let values =
+                        BooleanBuffer::from_iter(string_view_array.prefix_bytes_iter(v.len()).map(
+                            |haystack| {
                                 equals_bytes(
                                     haystack,
                                     v.as_bytes(),
                                     equals_ignore_ascii_case_kernel,
                                 ) != negate
-                            })
-                            .collect::<Vec<_>>(),
-                    );
+                            },
+                        ));
                     BooleanArray::new(values, nulls)
                 } else {
                     BooleanArray::from_unary(array, |haystack| {
@@ -158,14 +186,12 @@ impl<'a> Predicate<'a> {
             Predicate::EndsWith(v) => {
                 if let Some(string_view_array) = array.as_any().downcast_ref::<StringViewArray>() {
                     let nulls = string_view_array.logical_nulls();
-                    let values = BooleanBuffer::from(
-                        string_view_array
-                            .suffix_bytes_iter(v.len())
-                            .map(|haystack| {
+                    let values =
+                        BooleanBuffer::from_iter(string_view_array.suffix_bytes_iter(v.len()).map(
+                            |haystack| {
                                 equals_bytes(haystack, v.as_bytes(), equals_kernel) != negate
-                            })
-                            .collect::<Vec<_>>(),
-                    );
+                            },
+                        ));
                     BooleanArray::new(values, nulls)
                 } else {
                     BooleanArray::from_unary(array, |haystack| {
@@ -176,18 +202,16 @@ impl<'a> Predicate<'a> {
             Predicate::IEndsWithAscii(v) => {
                 if let Some(string_view_array) = array.as_any().downcast_ref::<StringViewArray>() {
                     let nulls = string_view_array.logical_nulls();
-                    let values = BooleanBuffer::from(
-                        string_view_array
-                            .suffix_bytes_iter(v.len())
-                            .map(|haystack| {
+                    let values =
+                        BooleanBuffer::from_iter(string_view_array.suffix_bytes_iter(v.len()).map(
+                            |haystack| {
                                 equals_bytes(
                                     haystack,
                                     v.as_bytes(),
                                     equals_ignore_ascii_case_kernel,
                                 ) != negate
-                            })
-                            .collect::<Vec<_>>(),
-                    );
+                            },
+                        ));
                     BooleanArray::new(values, nulls)
                 } else {
                     BooleanArray::from_unary(array, |haystack| {
