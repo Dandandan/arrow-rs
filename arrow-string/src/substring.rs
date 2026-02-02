@@ -201,13 +201,13 @@ pub fn substring_by_char<OffsetSize: OffsetSizeTrait>(
 
     array.iter().for_each(|val| {
         if let Some(val) = val {
-            let char_count = val.chars().count();
-            let start = if start >= 0 {
-                start.to_usize().unwrap()
+            let (start_offset, end_offset) = if start >= 0 {
+                get_start_end_offset(val, start as usize, length)
             } else {
-                char_count - (-start).to_usize().unwrap().min(char_count)
+                let char_count = val.chars().count();
+                let start_idx = char_count.saturating_sub((-start) as usize);
+                get_start_end_offset(val, start_idx, length)
             };
-            let (start_offset, end_offset) = get_start_end_offset(val, start, length);
             vals.append_slice(&val.as_bytes()[start_offset..end_offset]);
         }
         new_offsets.append(OffsetSize::from_usize(vals.len()).unwrap());
