@@ -17,6 +17,7 @@
 
 use arrow_array::{Array, ArrayAccessor, BooleanArray, StringViewArray};
 use arrow_buffer::BooleanBuffer;
+use arrow_data::ByteView;
 use arrow_schema::ArrowError;
 use memchr::memchr3;
 use memchr::memmem::Finder;
@@ -106,23 +107,197 @@ impl<'a> Predicate<'a> {
         T: ArrayAccessor<Item = &'i str>,
     {
         match self {
-            Predicate::Eq(v) => BooleanArray::from_unary(array, |haystack| {
-                (haystack.len() == v.len() && haystack == *v) != negate
-            }),
-            Predicate::IEqAscii(v) => BooleanArray::from_unary(array, |haystack| {
-                haystack.eq_ignore_ascii_case(v) != negate
-            }),
-            Predicate::Contains(finder) => BooleanArray::from_unary(array, |haystack| {
-                finder.find(haystack.as_bytes()).is_some() != negate
-            }),
+            Predicate::Eq(v) => {
+                if let Some(string_view_array) = array.as_any().downcast_ref::<StringViewArray>() {
+                    let nulls = string_view_array.logical_nulls();
+                    let v_bytes = v.as_bytes();
+                    let v_len = v_bytes.len();
+                    let v_prefix = if v_len >= 4 {
+                        u32::from_le_bytes(v_bytes[0..4].try_into().unwrap())
+                    } else {
+                        0
+                    };
+
+                    let values = BooleanBuffer::from(
+                        string_view_array
+                            .views()
+                            .iter()
+                            .map(|&view| {
+                                let len = view as u32;
+                                if len as usize != v_len {
+                                    return negate;
+                                }
+                                if len <= 12 {
+                                    let inlined =
+                                        unsafe { StringViewArray::inline_value(&view, len as usize) };
+                                    (inlined == v_bytes) != negate
+                                } else {
+                                    let view_prefix = (view >> 32) as u32;
+                                    if view_prefix != v_prefix {
+                                        return negate;
+                                    }
+                                    let view_struct = ByteView::from(view);
+                                    let data = unsafe {
+                                        string_view_array
+                                            .data_buffers()
+                                            .get_unchecked(view_struct.buffer_index as usize)
+                                    };
+                                    let offset = view_struct.offset as usize;
+                                    let full_data = unsafe {
+                                        data.get_unchecked(offset..offset + len as usize)
+                                    };
+                                    (full_data == v_bytes) != negate
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    BooleanArray::new(values, nulls)
+                } else {
+                    BooleanArray::from_unary(array, |haystack| {
+                        (haystack.len() == v.len() && haystack == *v) != negate
+                    })
+                }
+            }
+            Predicate::IEqAscii(v) => {
+                if let Some(string_view_array) = array.as_any().downcast_ref::<StringViewArray>() {
+                    let nulls = string_view_array.logical_nulls();
+                    let v_bytes = v.as_bytes();
+                    let v_len = v_bytes.len();
+
+                    let values = BooleanBuffer::from(
+                        string_view_array
+                            .views()
+                            .iter()
+                            .map(|&view| {
+                                let len = view as u32;
+                                if len as usize != v_len {
+                                    return negate;
+                                }
+                                if len <= 12 {
+                                    let inlined =
+                                        unsafe { StringViewArray::inline_value(&view, len as usize) };
+                                    let haystack = unsafe { std::str::from_utf8_unchecked(inlined) };
+                                    (haystack.eq_ignore_ascii_case(v)) != negate
+                                } else {
+                                    let view_prefix =
+                                        unsafe { StringViewArray::inline_value(&view, 4) };
+                                    if !zip(view_prefix, &v_bytes[0..4])
+                                        .all(equals_ignore_ascii_case_kernel)
+                                    {
+                                        return negate;
+                                    }
+                                    let view_struct = ByteView::from(view);
+                                    let data = unsafe {
+                                        string_view_array
+                                            .data_buffers()
+                                            .get_unchecked(view_struct.buffer_index as usize)
+                                    };
+                                    let offset = view_struct.offset as usize;
+                                    let full_data = unsafe {
+                                        data.get_unchecked(offset..offset + len as usize)
+                                    };
+                                    let haystack =
+                                        unsafe { std::str::from_utf8_unchecked(full_data) };
+                                    (haystack.eq_ignore_ascii_case(v)) != negate
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    BooleanArray::new(values, nulls)
+                } else {
+                    BooleanArray::from_unary(array, |haystack| {
+                        haystack.eq_ignore_ascii_case(v) != negate
+                    })
+                }
+            }
+            Predicate::Contains(finder) => {
+                if let Some(string_view_array) = array.as_any().downcast_ref::<StringViewArray>() {
+                    let nulls = string_view_array.logical_nulls();
+                    let needle = finder.needle();
+                    let needle_len = needle.len();
+                    let values = BooleanBuffer::from(
+                        string_view_array
+                            .views()
+                            .iter()
+                            .map(|&view| {
+                                let len = view as u32;
+                                if (len as usize) < needle_len {
+                                    return negate;
+                                }
+                                let haystack = if len <= 12 {
+                                    unsafe { StringViewArray::inline_value(&view, len as usize) }
+                                } else {
+                                    let view_struct = ByteView::from(view);
+                                    let data = unsafe {
+                                        string_view_array
+                                            .data_buffers()
+                                            .get_unchecked(view_struct.buffer_index as usize)
+                                    };
+                                    let offset = view_struct.offset as usize;
+                                    unsafe { data.get_unchecked(offset..offset + len as usize) }
+                                };
+                                (finder.find(haystack).is_some()) != negate
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    BooleanArray::new(values, nulls)
+                } else {
+                    BooleanArray::from_unary(array, |haystack| {
+                        finder.find(haystack.as_bytes()).is_some() != negate
+                    })
+                }
+            }
             Predicate::StartsWith(v) => {
                 if let Some(string_view_array) = array.as_any().downcast_ref::<StringViewArray>() {
                     let nulls = string_view_array.logical_nulls();
+                    let v_bytes = v.as_bytes();
+                    let v_len = v_bytes.len();
+                    let v_prefix = if v_len >= 4 {
+                        u32::from_le_bytes(v_bytes[0..4].try_into().unwrap())
+                    } else {
+                        let mut b = [0u8; 4];
+                        b[..v_len].copy_from_slice(v_bytes);
+                        u32::from_le_bytes(b)
+                    };
+                    let v_mask = if v_len < 4 {
+                        (1u64 << (v_len * 8)) as u32 - 1
+                    } else {
+                        0xFFFFFFFF
+                    };
+
                     let values = BooleanBuffer::from(
                         string_view_array
-                            .prefix_bytes_iter(v.len())
-                            .map(|haystack| {
-                                equals_bytes(haystack, v.as_bytes(), equals_kernel) != negate
+                            .views()
+                            .iter()
+                            .map(|&view| {
+                                let len = view as u32;
+                                if (len as usize) < v_len {
+                                    return negate;
+                                }
+                                let view_prefix = (view >> 32) as u32;
+                                if (view_prefix & v_mask) != v_prefix {
+                                    return negate;
+                                }
+                                if v_len <= 4 {
+                                    return !negate;
+                                }
+                                if len <= 12 {
+                                    let inlined =
+                                        unsafe { StringViewArray::inline_value(&view, len as usize) };
+                                    (inlined.starts_with(v_bytes)) != negate
+                                } else {
+                                    let view_struct = ByteView::from(view);
+                                    let data = unsafe {
+                                        string_view_array
+                                            .data_buffers()
+                                            .get_unchecked(view_struct.buffer_index as usize)
+                                    };
+                                    let offset = view_struct.offset as usize;
+                                    let full_data = unsafe {
+                                        data.get_unchecked(offset..offset + len as usize)
+                                    };
+                                    (full_data.starts_with(v_bytes)) != negate
+                                }
                             })
                             .collect::<Vec<_>>(),
                     );
