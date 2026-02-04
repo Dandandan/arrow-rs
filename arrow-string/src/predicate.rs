@@ -106,15 +106,94 @@ impl<'a> Predicate<'a> {
         T: ArrayAccessor<Item = &'i str>,
     {
         match self {
-            Predicate::Eq(v) => BooleanArray::from_unary(array, |haystack| {
-                (haystack.len() == v.len() && haystack == *v) != negate
-            }),
-            Predicate::IEqAscii(v) => BooleanArray::from_unary(array, |haystack| {
-                haystack.eq_ignore_ascii_case(v) != negate
-            }),
-            Predicate::Contains(finder) => BooleanArray::from_unary(array, |haystack| {
-                finder.find(haystack.as_bytes()).is_some() != negate
-            }),
+            Predicate::Eq(v) => {
+                if let Some(string_view_array) = array.as_any().downcast_ref::<StringViewArray>() {
+                    let v_bytes = v.as_bytes();
+                    let v_len = v_bytes.len() as u32;
+                    let v_prefix = if v_len >= 4 {
+                        u32::from_le_bytes(v_bytes[0..4].try_into().unwrap())
+                    } else {
+                        0
+                    };
+                    let nulls = string_view_array.logical_nulls();
+                    let values = BooleanBuffer::from(
+                        string_view_array
+                            .views()
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &v_u128)| {
+                                let len = v_u128 as u32;
+                                if len != v_len {
+                                    return negate;
+                                }
+                                if len <= 12 {
+                                    return (string_view_array.value(i) == *v) != negate;
+                                }
+                                if (v_u128 >> 32) as u32 != v_prefix {
+                                    return negate;
+                                }
+                                (string_view_array.value(i) == *v) != negate
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    BooleanArray::new(values, nulls)
+                } else {
+                    BooleanArray::from_unary(array, |haystack| {
+                        (haystack.len() == v.len() && haystack == *v) != negate
+                    })
+                }
+            }
+            Predicate::IEqAscii(v) => {
+                if let Some(string_view_array) = array.as_any().downcast_ref::<StringViewArray>() {
+                    let v_len = v.len() as u32;
+                    let nulls = string_view_array.logical_nulls();
+                    let values = BooleanBuffer::from(
+                        string_view_array
+                            .views()
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &v_u128)| {
+                                let len = v_u128 as u32;
+                                if len != v_len {
+                                    return negate;
+                                }
+                                (string_view_array.value(i).eq_ignore_ascii_case(v)) != negate
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    BooleanArray::new(values, nulls)
+                } else {
+                    BooleanArray::from_unary(array, |haystack| {
+                        haystack.eq_ignore_ascii_case(v) != negate
+                    })
+                }
+            }
+            Predicate::Contains(finder) => {
+                if let Some(string_view_array) = array.as_any().downcast_ref::<StringViewArray>() {
+                    let needle_len = finder.needle().len();
+                    let nulls = string_view_array.logical_nulls();
+                    let values = BooleanBuffer::from(
+                        string_view_array
+                            .views()
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &v_u128)| {
+                                let len = v_u128 as u32;
+                                if (len as usize) < needle_len {
+                                    return negate;
+                                }
+                                (finder.find(string_view_array.value(i).as_bytes()).is_some())
+                                    != negate
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    BooleanArray::new(values, nulls)
+                } else {
+                    BooleanArray::from_unary(array, |haystack| {
+                        finder.find(haystack.as_bytes()).is_some() != negate
+                    })
+                }
+            }
             Predicate::StartsWith(v) => {
                 if let Some(string_view_array) = array.as_any().downcast_ref::<StringViewArray>() {
                     let nulls = string_view_array.logical_nulls();
@@ -122,7 +201,7 @@ impl<'a> Predicate<'a> {
                         string_view_array
                             .prefix_bytes_iter(v.len())
                             .map(|haystack| {
-                                equals_bytes(haystack, v.as_bytes(), equals_kernel) != negate
+                                (haystack.len() == v.len() && haystack == v.as_bytes()) != negate
                             })
                             .collect::<Vec<_>>(),
                     );
@@ -140,11 +219,9 @@ impl<'a> Predicate<'a> {
                         string_view_array
                             .prefix_bytes_iter(v.len())
                             .map(|haystack| {
-                                equals_bytes(
-                                    haystack,
-                                    v.as_bytes(),
-                                    equals_ignore_ascii_case_kernel,
-                                ) != negate
+                                (haystack.len() == v.len()
+                                    && haystack.eq_ignore_ascii_case(v.as_bytes()))
+                                    != negate
                             })
                             .collect::<Vec<_>>(),
                     );
@@ -162,7 +239,7 @@ impl<'a> Predicate<'a> {
                         string_view_array
                             .suffix_bytes_iter(v.len())
                             .map(|haystack| {
-                                equals_bytes(haystack, v.as_bytes(), equals_kernel) != negate
+                                (haystack.len() == v.len() && haystack == v.as_bytes()) != negate
                             })
                             .collect::<Vec<_>>(),
                     );
@@ -180,11 +257,9 @@ impl<'a> Predicate<'a> {
                         string_view_array
                             .suffix_bytes_iter(v.len())
                             .map(|haystack| {
-                                equals_bytes(
-                                    haystack,
-                                    v.as_bytes(),
-                                    equals_ignore_ascii_case_kernel,
-                                ) != negate
+                                (haystack.len() == v.len()
+                                    && haystack.eq_ignore_ascii_case(v.as_bytes()))
+                                    != negate
                             })
                             .collect::<Vec<_>>(),
                     );
@@ -200,10 +275,6 @@ impl<'a> Predicate<'a> {
             }
         }
     }
-}
-
-fn equals_bytes(lhs: &[u8], rhs: &[u8], byte_eq_kernel: impl Fn((&u8, &u8)) -> bool) -> bool {
-    lhs.len() == rhs.len() && zip(lhs, rhs).all(byte_eq_kernel)
 }
 
 /// This is faster than `str::starts_with` for small strings.

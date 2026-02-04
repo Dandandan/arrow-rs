@@ -25,7 +25,7 @@ use arrow::array::*;
 use arrow::compute::kernels::length::length;
 use std::hint;
 
-fn bench_length(array: &StringArray) {
+fn bench_length(array: &dyn Array) {
     hint::black_box(length(array).unwrap());
 }
 
@@ -39,9 +39,13 @@ fn add_benchmark(c: &mut Criterion) {
     for _ in 0..10 {
         values = double_vec(values);
     }
-    let array = StringArray::from(values);
+    let array = StringArray::from(values.clone());
+    let large_array = LargeStringArray::from(values.clone());
+    let view_array = StringViewArray::from(values);
 
-    c.bench_function("length", |b| b.iter(|| bench_length(&array)));
+    c.bench_function("length_utf8", |b| b.iter(|| bench_length(&array)));
+    c.bench_function("length_large_utf8", |b| b.iter(|| bench_length(&large_array)));
+    c.bench_function("length_utf8_view", |b| b.iter(|| bench_length(&view_array)));
 }
 
 criterion_group!(benches, add_benchmark);
