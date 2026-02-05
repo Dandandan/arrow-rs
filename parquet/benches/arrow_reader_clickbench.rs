@@ -76,7 +76,7 @@ fn async_reader(c: &mut Criterion) {
 }
 
 fn async_reader_object_store(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
@@ -791,20 +791,31 @@ impl ObjectStore for LocalFileSystemOneFile {
         // This blocking operation is performed in a separate thread
         // This slows down the benchmark, but avoids blocking the async runtime
         maybe_spawn_blocking(move || {
-            let mut result = Vec::with_capacity(ranges.len());
-            for range in ranges {
-                let mut buf = vec![0u8; (range.end - range.start) as usize];
+            let total_size: usize = ranges.iter().map(|r| (r.end - r.start) as usize).sum();
+            let mut buf = vec![0u8; total_size];
+            let mut offset = 0;
 
-                file
-                    .read_at(&mut buf, range.start)
+            for range in &ranges {
+                let len = (range.end - range.start) as usize;
+                file.read_at(&mut buf[offset..offset + len], range.start)
                     .map_err(|e| object_store::Error::Generic {
                         store: "LocalFileSystemOneFile",
                         source: Box::new(e),
                     })?;
-                result.push(buf.into());
+                offset += len;
+            }
+
+            let buf: Bytes = buf.into();
+            let mut offset = 0;
+            let mut result = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                let len = (range.end - range.start) as usize;
+                result.push(buf.slice(offset..offset + len));
+                offset += len;
             }
             Ok(result)
-        }).await
+        })
+        .await
     }
 
     fn list(&self, prefix: Option<&ObjectStorePath>) -> BoxStream<'static, Result<ObjectMeta>> {
