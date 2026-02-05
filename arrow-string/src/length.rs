@@ -19,7 +19,7 @@
 
 use arrow_array::*;
 use arrow_array::{cast::AsArray, types::*};
-use arrow_buffer::{ArrowNativeType, NullBuffer, OffsetBuffer};
+use arrow_buffer::{ArrowNativeType, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType};
 use std::sync::Arc;
 
@@ -27,11 +27,14 @@ fn length_impl<P: ArrowPrimitiveType>(
     offsets: &OffsetBuffer<P::Native>,
     nulls: Option<&NullBuffer>,
 ) -> ArrayRef {
-    let v: Vec<_> = offsets
-        .windows(2)
-        .map(|w| w[1].sub_wrapping(w[0]))
-        .collect();
-    Arc::new(PrimitiveArray::<P>::new(v.into(), nulls.cloned()))
+    let off = offsets.as_ref();
+    let v = off
+        .iter()
+        .skip(1)
+        .zip(off)
+        .map(|(a, b): (&P::Native, &P::Native)| a.sub_wrapping(*b));
+    let buffer = ScalarBuffer::from_iter(v);
+    Arc::new(PrimitiveArray::<P>::new(buffer, nulls.cloned()))
 }
 
 fn bit_length_impl<P: ArrowPrimitiveType>(
@@ -39,9 +42,14 @@ fn bit_length_impl<P: ArrowPrimitiveType>(
     nulls: Option<&NullBuffer>,
 ) -> ArrayRef {
     let bits = P::Native::usize_as(8);
-    let c = |w: &[P::Native]| w[1].sub_wrapping(w[0]).mul_wrapping(bits);
-    let v: Vec<_> = offsets.windows(2).map(c).collect();
-    Arc::new(PrimitiveArray::<P>::new(v.into(), nulls.cloned()))
+    let off = offsets.as_ref();
+    let v = off
+        .iter()
+        .skip(1)
+        .zip(off)
+        .map(|(a, b): (&P::Native, &P::Native)| a.sub_wrapping(*b).mul_wrapping(bits));
+    let buffer = ScalarBuffer::from_iter(v);
+    Arc::new(PrimitiveArray::<P>::new(buffer, nulls.cloned()))
 }
 
 /// Returns an array of Int32/Int64 denoting the length of each value in the array.
@@ -77,11 +85,8 @@ pub fn length(array: &dyn Array) -> Result<ArrayRef, ArrowError> {
         }
         DataType::Utf8View => {
             let list = array.as_string_view();
-            let v = list.views().iter().map(|v| *v as i32).collect::<Vec<_>>();
-            Ok(Arc::new(PrimitiveArray::<Int32Type>::new(
-                v.into(),
-                list.nulls().cloned(),
-            )))
+            let v = ScalarBuffer::from_iter(list.views().iter().map(|v| *v as i32));
+            Ok(Arc::new(Int32Array::new(v, list.nulls().cloned())))
         }
         DataType::Binary => {
             let list = array.as_binary::<i32>();
@@ -91,16 +96,14 @@ pub fn length(array: &dyn Array) -> Result<ArrayRef, ArrowError> {
             let list = array.as_binary::<i64>();
             Ok(length_impl::<Int64Type>(list.offsets(), list.nulls()))
         }
-        DataType::FixedSizeBinary(len) | DataType::FixedSizeList(_, len) => Ok(Arc::new(
-            Int32Array::new(vec![*len; array.len()].into(), array.nulls().cloned()),
-        )),
+        DataType::FixedSizeBinary(len) | DataType::FixedSizeList(_, len) => {
+            let v = ScalarBuffer::from_iter(std::iter::repeat(*len).take(array.len()));
+            Ok(Arc::new(Int32Array::new(v, array.nulls().cloned())))
+        }
         DataType::BinaryView => {
             let list = array.as_binary_view();
-            let v = list.views().iter().map(|v| *v as i32).collect::<Vec<_>>();
-            Ok(Arc::new(PrimitiveArray::<Int32Type>::new(
-                v.into(),
-                list.nulls().cloned(),
-            )))
+            let v = ScalarBuffer::from_iter(list.views().iter().map(|v| *v as i32));
+            Ok(Arc::new(Int32Array::new(v, list.nulls().cloned())))
         }
         other => Err(ArrowError::ComputeError(format!(
             "length not supported for {other:?}"
@@ -139,11 +142,8 @@ pub fn bit_length(array: &dyn Array) -> Result<ArrayRef, ArrowError> {
         }
         DataType::Utf8View => {
             let list = array.as_string_view();
-            let values = list
-                .views()
-                .iter()
-                .map(|view| (*view as i32).wrapping_mul(8))
-                .collect();
+            let values =
+                ScalarBuffer::from_iter(list.views().iter().map(|view| (*view as i32).wrapping_mul(8)));
             Ok(Arc::new(Int32Array::new(values, array.nulls().cloned())))
         }
         DataType::Binary => {
@@ -154,10 +154,10 @@ pub fn bit_length(array: &dyn Array) -> Result<ArrayRef, ArrowError> {
             let list = array.as_binary::<i64>();
             Ok(bit_length_impl::<Int64Type>(list.offsets(), list.nulls()))
         }
-        DataType::FixedSizeBinary(len) => Ok(Arc::new(Int32Array::new(
-            vec![*len * 8; array.len()].into(),
-            array.nulls().cloned(),
-        ))),
+        DataType::FixedSizeBinary(len) => {
+            let v = ScalarBuffer::from_iter(std::iter::repeat(*len * 8).take(array.len()));
+            Ok(Arc::new(Int32Array::new(v, array.nulls().cloned())))
+        }
         other => Err(ArrowError::ComputeError(format!(
             "bit_length not supported for {other:?}"
         ))),
