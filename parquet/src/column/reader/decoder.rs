@@ -17,6 +17,9 @@
 
 use bytes::Bytes;
 
+#[cfg(feature = "arrow")]
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
+
 use crate::basic::{Encoding, EncodingMask};
 use crate::data_type::DataType;
 use crate::encodings::{
@@ -28,13 +31,16 @@ use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{BitReader, num_required_bits};
 
 /// Decodes level data
+/// Decoder for column levels (repetition or definition)
 pub trait ColumnLevelDecoder {
+    /// The buffer type used to store decoded levels
     type Buffer;
 
     /// Set data for this [`ColumnLevelDecoder`]
     fn set_data(&mut self, encoding: Encoding, data: Bytes) -> Result<()>;
 }
 
+/// Decoder for repetition levels
 pub trait RepetitionLevelDecoder: ColumnLevelDecoder {
     /// Read up to `max_records` of repetition level data into `out` returning the number
     /// of complete records and levels read
@@ -65,6 +71,7 @@ pub trait RepetitionLevelDecoder: ColumnLevelDecoder {
     fn flush_partial(&mut self) -> bool;
 }
 
+/// Decoder for definition levels
 pub trait DefinitionLevelDecoder: ColumnLevelDecoder {
     /// Read up to `num_levels` definition levels into `out`.
     ///
@@ -85,8 +92,54 @@ pub trait DefinitionLevelDecoder: ColumnLevelDecoder {
     fn skip_def_levels(&mut self, num_levels: usize) -> Result<(usize, usize)>;
 }
 
+#[cfg(feature = "arrow")]
+/// Trait for buffers that store definition levels and can provide a null mask
+pub trait DefinitionLevelBufferTrait {
+    /// Returns the null mask for the decoded levels
+    fn nulls(&self) -> &BooleanBufferBuilder;
+}
+
+#[cfg(feature = "arrow")]
+impl DefinitionLevelBufferTrait for Vec<i16> {
+    fn nulls(&self) -> &BooleanBufferBuilder {
+        panic!("nulls not supported for Vec<i16>")
+    }
+}
+
+/// Trait for buffers that store repetition levels
+pub trait RepetitionLevelBufferTrait {
+    /// Returns the repetition levels as a slice
+    fn levels(&self) -> &[i16];
+}
+
+impl RepetitionLevelBufferTrait for Vec<i16> {
+    fn levels(&self) -> &[i16] {
+        self.as_slice()
+    }
+}
+
+/// A predicate to evaluate during decoding
+#[cfg(feature = "arrow")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnPredicate {
+    /// col <> ''
+    NotEmpty,
+}
+
+#[cfg(feature = "arrow")]
+impl ColumnPredicate {
+    /// Evaluate the predicate on a value of the given length
+    pub fn evaluate_length(&self, len: usize) -> bool {
+        match self {
+            Self::NotEmpty => len > 0,
+        }
+    }
+}
+
 /// Decodes value data
+/// Decoder for column values
 pub trait ColumnValueDecoder {
+    /// The buffer type used to store decoded values
     type Buffer;
 
     /// Create a new [`ColumnValueDecoder`]
@@ -132,6 +185,18 @@ pub trait ColumnValueDecoder {
     ///
     /// Returns the number of values skipped
     fn skip_values(&mut self, num_values: usize) -> Result<usize>;
+
+    /// Read up to `num_values` values and evaluate the predicate, returning a boolean mask.
+    #[cfg(feature = "arrow")]
+    fn read_boolean(
+        &mut self,
+        _num_values: usize,
+        _predicate: ColumnPredicate,
+    ) -> Result<BooleanBuffer> {
+        Err(ParquetError::General(
+            "read_boolean not supported".to_string(),
+        ))
+    }
 }
 
 /// Bucket-based storage for decoder instances keyed by `Encoding`.
@@ -297,6 +362,7 @@ pub struct DefinitionLevelDecoderImpl {
 }
 
 impl DefinitionLevelDecoderImpl {
+    /// Create a new `DefinitionLevelDecoderImpl`
     pub fn new(max_level: i16) -> Self {
         let bit_width = num_required_bits(max_level as u64);
         Self {
@@ -369,6 +435,7 @@ pub struct RepetitionLevelDecoderImpl {
 }
 
 impl RepetitionLevelDecoderImpl {
+    /// Create a new `RepetitionLevelDecoderImpl`
     pub fn new(max_level: i16) -> Self {
         let bit_width = num_required_bits(max_level as u64);
         Self {

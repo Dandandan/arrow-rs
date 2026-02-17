@@ -23,17 +23,18 @@ use arrow_schema::DataType as ArrowType;
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::arrow::arrow_reader::RowSelectionCursor;
 use crate::arrow::record_reader::GenericRecordReader;
 use crate::arrow::record_reader::buffer::ValuesBuffer;
 use crate::column::page::PageIterator;
-use crate::column::reader::decoder::ColumnValueDecoder;
+use crate::column::reader::decoder::{ColumnPredicate, ColumnValueDecoder};
 use crate::file::metadata::ParquetMetaData;
 use crate::file::reader::{FilePageIterator, FileReader};
 
 mod builder;
 mod byte_array;
 mod byte_array_dictionary;
-mod byte_view_array;
+pub(crate) mod byte_view_array;
 mod cached_array_reader;
 mod empty_array;
 mod fixed_len_byte_array;
@@ -132,6 +133,18 @@ pub trait ArrayReader: Send {
     ///
     /// This is used by parent [`ArrayReader`] to compute their array offsets
     fn get_rep_levels(&self) -> Option<&[i16]>;
+
+    /// Read up to `batch_size` records and evaluate the predicate, returning a boolean mask.
+    fn read_boolean(
+        &mut self,
+        _batch_size: usize,
+        _cursor: &mut RowSelectionCursor,
+        _predicate: ColumnPredicate,
+    ) -> Result<arrow_buffer::BooleanBuffer> {
+        Err(crate::errors::ParquetError::General(
+            "read_boolean not supported".to_string(),
+        ))
+    }
 }
 
 /// Interface for reading data pages from the columns of one or more RowGroups.
@@ -205,6 +218,43 @@ where
         }
     }
     Ok(records_read)
+}
+
+/// Uses `record_reader` to evaluate the predicate for up to `batch_size` records from `pages`
+#[cfg(feature = "arrow")]
+fn read_boolean<V, CV>(
+    record_reader: &mut GenericRecordReader<V, CV>,
+    pages: &mut dyn PageIterator,
+    batch_size: usize,
+    cursor: &mut RowSelectionCursor,
+    predicate: ColumnPredicate,
+) -> Result<arrow_buffer::BooleanBuffer>
+where
+    V: ValuesBuffer,
+    CV: ColumnValueDecoder<Buffer = V>,
+{
+    let mut total_read = 0;
+    let mut builder = arrow_buffer::BooleanBufferBuilder::new(0);
+    while total_read < batch_size {
+        let records_to_read = batch_size - total_read;
+
+        let res = record_reader.read_boolean(records_to_read, cursor, predicate)?;
+        let records_read_once = res.len();
+        builder.append_buffer(&res);
+        total_read += records_read_once;
+
+        // Record reader exhausted
+        if records_read_once < records_to_read {
+            if let Some(page_reader) = pages.next() {
+                // Read from new page reader (i.e. column chunk)
+                record_reader.set_page_reader(page_reader?)?;
+            } else {
+                // Page reader also exhausted
+                break;
+            }
+        }
+    }
+    Ok(builder.finish())
 }
 
 /// Uses `record_reader` to skip up to `batch_size` records from `pages`

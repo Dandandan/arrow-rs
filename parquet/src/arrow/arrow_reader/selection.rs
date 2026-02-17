@@ -885,6 +885,15 @@ pub struct MaskChunk {
     pub mask_start: usize,
 }
 
+/// Result of advancing a [`RowSelectionCursor`]
+#[derive(Debug)]
+pub enum CursorChunk {
+    /// Skip the given number of rows
+    Skip(usize),
+    /// Select the given number of rows
+    Select(usize),
+}
+
 /// Cursor for iterating a [`RowSelection`] during execution within a
 /// [`ReadPlan`](crate::arrow::arrow_reader::ReadPlan).
 ///
@@ -901,6 +910,59 @@ pub enum RowSelectionCursor {
 }
 
 impl RowSelectionCursor {
+    /// Returns true if there are no more rows to read
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::All => false,
+            Self::Mask(m) => m.is_empty(),
+            Self::Selectors(s) => s.is_empty(),
+        }
+    }
+
+    /// Advance the cursor by at most `max_rows`
+    pub fn next_chunk(&mut self, max_rows: usize) -> Option<CursorChunk> {
+        match self {
+            Self::All => Some(CursorChunk::Select(max_rows)),
+            Self::Mask(mask_cursor) => {
+                if mask_cursor.is_empty() {
+                    return None;
+                }
+                let mask = &mask_cursor.mask;
+                let start = mask_cursor.position;
+                let val = mask.value(start);
+                let mut end = start + 1;
+                while end < mask.len() && mask.value(end) == val && (end - start) < max_rows {
+                    end += 1;
+                }
+                mask_cursor.position = end;
+                if val {
+                    Some(CursorChunk::Select(end - start))
+                } else {
+                    Some(CursorChunk::Skip(end - start))
+                }
+            }
+            Self::Selectors(selectors_cursor) => {
+                if selectors_cursor.is_empty() {
+                    return None;
+                }
+                let mut front = selectors_cursor.next_selector();
+                let to_return = front.row_count.saturating_sub(max_rows);
+                front.row_count -= to_return;
+                if to_return > 0 {
+                    selectors_cursor.return_selector(RowSelector {
+                        row_count: to_return,
+                        skip: front.skip,
+                    });
+                }
+                if front.skip {
+                    Some(CursorChunk::Skip(front.row_count))
+                } else {
+                    Some(CursorChunk::Select(front.row_count))
+                }
+            }
+        }
+    }
+
     /// Create a [`MaskCursor`] cursor backed by a bitmask, from an existing set of selectors
     pub(crate) fn new_mask_from_selectors(selectors: Vec<RowSelector>) -> Self {
         Self::Mask(MaskCursor {

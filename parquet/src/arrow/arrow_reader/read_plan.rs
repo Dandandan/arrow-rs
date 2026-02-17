@@ -25,7 +25,7 @@ use crate::arrow::arrow_reader::{
     ArrowPredicate, ParquetRecordBatchReader, RowSelection, RowSelectionCursor, RowSelector,
 };
 use crate::errors::{ParquetError, Result};
-use arrow_array::Array;
+use arrow_array::{Array, BooleanArray};
 use arrow_select::filter::prep_null_mask_filter;
 use std::collections::VecDeque;
 
@@ -142,26 +142,37 @@ impl ReadPlanBuilder {
     /// [`RowSelection`] in addition to one or more predicates.
     pub fn with_predicate(
         mut self,
-        array_reader: Box<dyn ArrayReader>,
+        mut array_reader: Box<dyn ArrayReader>,
         predicate: &mut dyn ArrowPredicate,
     ) -> Result<Self> {
-        let reader = ParquetRecordBatchReader::new(array_reader, self.clone().build());
         let mut filters = vec![];
-        for maybe_batch in reader {
-            let maybe_batch = maybe_batch?;
-            let input_rows = maybe_batch.num_rows();
-            let filter = predicate.evaluate(maybe_batch)?;
-            // Since user supplied predicate, check error here to catch bugs quickly
-            if filter.len() != input_rows {
-                return Err(arrow_err!(
-                    "ArrowPredicate predicate returned {} rows, expected {input_rows}",
-                    filter.len()
-                ));
+        if let Some(col_predicate) = predicate.as_column_predicate() {
+            let mut cursor = self.clone().build().row_selection_cursor;
+            loop {
+                let filter = array_reader.read_boolean(self.batch_size, &mut cursor, col_predicate)?;
+                if filter.is_empty() {
+                    break;
+                }
+                filters.push(BooleanArray::new(filter, None));
             }
-            match filter.null_count() {
-                0 => filters.push(filter),
-                _ => filters.push(prep_null_mask_filter(&filter)),
-            };
+        } else {
+            let reader = ParquetRecordBatchReader::new(array_reader, self.clone().build());
+            for maybe_batch in reader {
+                let maybe_batch = maybe_batch?;
+                let input_rows = maybe_batch.num_rows();
+                let filter = predicate.evaluate(maybe_batch)?;
+                // Since user supplied predicate, check error here to catch bugs quickly
+                if filter.len() != input_rows {
+                    return Err(arrow_err!(
+                        "ArrowPredicate predicate returned {} rows, expected {input_rows}",
+                        filter.len()
+                    ));
+                }
+                match filter.null_count() {
+                    0 => filters.push(filter),
+                    _ => filters.push(prep_null_mask_filter(&filter)),
+                };
+            }
         }
 
         let raw = RowSelection::from_filters(&filters);

@@ -33,14 +33,17 @@
 use arrow::compute::kernels::cmp::{eq, neq};
 use arrow::compute::{like, nlike, or};
 use arrow_array::types::{Int16Type, Int32Type, Int64Type};
-use arrow_array::{ArrayRef, ArrowPrimitiveType, BooleanArray, PrimitiveArray, StringViewArray};
+use arrow_array::{
+    ArrayRef, ArrowPrimitiveType, BooleanArray, PrimitiveArray, RecordBatch, StringViewArray,
+};
 use arrow_schema::{ArrowError, DataType, Schema};
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures::StreamExt;
 use parquet::arrow::arrow_reader::{
-    ArrowPredicate, ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions,
+    ArrowPredicate, ArrowReaderMetadata, ArrowReaderOptions,
     ParquetRecordBatchReaderBuilder, RowFilter,
 };
+use parquet::column::reader::decoder::ColumnPredicate;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::schema::types::SchemaDescriptor;
 use std::fmt::{Display, Formatter};
@@ -470,6 +473,8 @@ struct ClickBenchPredicate {
     /// This is necessary (and awkward) because  `ArrowPredicateFn` does not
     /// implement `Clone`, so it must be created for each reader instance.
     predicate_factory: Box<dyn Fn() -> Box<ColumnPredicateFn>>,
+    /// Optional optimized column predicate
+    column_predicate: Option<ColumnPredicate>,
 }
 
 impl ClickBenchPredicate {
@@ -485,7 +490,13 @@ impl ClickBenchPredicate {
         Self {
             column_index,
             predicate_factory: Box::new(predicate_factory),
+            column_predicate: None,
         }
+    }
+
+    fn with_column_predicate(mut self, column_predicate: ColumnPredicate) -> Self {
+        self.column_predicate = Some(column_predicate);
+        self
     }
 
     fn column_index(&self) -> usize {
@@ -536,6 +547,7 @@ impl ClickBenchPredicate {
             let empty_string = StringViewArray::new_scalar("");
             Box::new(move |col| neq(col, &empty_string))
         })
+        .with_column_predicate(ColumnPredicate::NotEmpty)
     }
 
     /// Create Predicate: col LIKE '%google%'
@@ -810,16 +822,39 @@ impl ReadTest {
                 let orig_column_index = pred.column_index();
                 let column_index = self.filter_indices.map_column(orig_column_index);
                 let mut predicate_fn = pred.predicate_fn();
-                Box::new(ArrowPredicateFn::new(
-                    self.filter_mask.clone(),
-                    move |batch| (predicate_fn)(batch.column(column_index)),
-                )) as Box<dyn ArrowPredicate>
+                Box::new(ClickBenchArrowPredicate {
+                    projection: self.filter_mask.clone(),
+                    evaluate_fn: Box::new(move |batch| (predicate_fn)(batch.column(column_index))),
+                    column_predicate: pred.column_predicate,
+                }) as Box<dyn ArrowPredicate>
             })
             .collect();
 
         RowFilter::new(arrow_predicates)
     }
+}
 
+struct ClickBenchArrowPredicate {
+    projection: ProjectionMask,
+    evaluate_fn: Box<dyn FnMut(RecordBatch) -> Result<BooleanArray, ArrowError> + Send>,
+    column_predicate: Option<ColumnPredicate>,
+}
+
+impl ArrowPredicate for ClickBenchArrowPredicate {
+    fn projection(&self) -> &ProjectionMask {
+        &self.projection
+    }
+
+    fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
+        (self.evaluate_fn)(batch)
+    }
+
+    fn as_column_predicate(&self) -> Option<ColumnPredicate> {
+        self.column_predicate
+    }
+}
+
+impl ReadTest {
     fn check_row_count(&self, row_count: usize) {
         let expected_row_count = self.expected_row_count;
         assert_eq!(

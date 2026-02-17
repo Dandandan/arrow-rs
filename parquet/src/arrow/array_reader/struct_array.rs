@@ -16,6 +16,8 @@
 // under the License.
 
 use crate::arrow::array_reader::ArrayReader;
+use crate::arrow::arrow_reader::RowSelectionCursor;
+use crate::column::reader::decoder::ColumnPredicate;
 use crate::errors::{ParquetError, Result};
 use arrow_array::{Array, ArrayRef, StructArray, builder::BooleanBufferBuilder};
 use arrow_data::{ArrayData, ArrayDataBuilder};
@@ -206,6 +208,21 @@ impl ArrayReader for StructArrayReader {
         // Children definition levels should describe the same
         // parent structure, so return first child's
         self.children.first().and_then(|l| l.get_rep_levels())
+    }
+
+    fn read_boolean(
+        &mut self,
+        batch_size: usize,
+        cursor: &mut RowSelectionCursor,
+        predicate: ColumnPredicate,
+    ) -> Result<arrow_buffer::BooleanBuffer> {
+        if self.children.len() == 1 {
+            self.children[0].read_boolean(batch_size, cursor, predicate)
+        } else {
+            Err(ParquetError::General(
+                "read_boolean not supported for multi-column structs".to_string(),
+            ))
+        }
     }
 }
 

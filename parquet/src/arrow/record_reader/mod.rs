@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_buffer::Buffer;
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, Buffer};
 
+use crate::arrow::arrow_reader::selection::{CursorChunk, RowSelectionCursor};
 use crate::arrow::record_reader::{
     buffer::ValuesBuffer,
     definition_levels::{DefinitionLevelBuffer, DefinitionLevelBufferDecoder},
 };
-use crate::column::reader::decoder::RepetitionLevelDecoderImpl;
+use crate::column::reader::decoder::{ColumnPredicate, RepetitionLevelDecoderImpl};
 use crate::column::{
     page::PageReader,
     reader::{
@@ -103,6 +104,73 @@ where
             rep_level_decoder,
         ));
         Ok(())
+    }
+
+    /// Try to read `num_records` of column data and evaluate the predicate.
+    ///
+    /// # Returns
+    ///
+    /// The boolean mask of evaluated values.
+    pub fn read_boolean(
+        &mut self,
+        num_records: usize,
+        cursor: &mut RowSelectionCursor,
+        predicate: ColumnPredicate,
+    ) -> Result<BooleanBuffer> {
+        if self.column_reader.is_none() {
+            return Ok(BooleanBuffer::from(Vec::<bool>::new()));
+        }
+
+        let mut total_records_read = 0;
+        let mut builder = BooleanBufferBuilder::new(0);
+
+        while total_records_read < num_records {
+            let to_read = num_records - total_records_read;
+            match cursor.next_chunk(to_read) {
+                Some(CursorChunk::Skip(skip)) => {
+                    let skipped = self.skip_records(skip)?;
+                    builder.append_n(skipped, false);
+                    total_records_read += skipped;
+                    if skipped < skip {
+                        break;
+                    }
+                }
+                Some(CursorChunk::Select(select)) => {
+                    let mut read_in_chunk = 0;
+                    while read_in_chunk < select && self.column_reader.as_mut().unwrap().has_next()?
+                    {
+                        let records_to_read = select - read_in_chunk;
+                        let (records_read, values_bool, _levels_read) = self
+                            .column_reader
+                            .as_mut()
+                            .unwrap()
+                            .read_boolean(
+                                records_to_read,
+                                self.def_levels.as_mut(),
+                                self.rep_levels.as_mut(),
+                                predicate,
+                            )?;
+
+                        builder.append_buffer(&values_bool);
+                        read_in_chunk += records_read;
+                        total_records_read += records_read;
+
+                        // Clear levels to avoid memory growth during evaluation
+                        if let Some(def_levels) = self.def_levels.as_mut() {
+                            def_levels.reset();
+                        }
+                        if let Some(rep_levels) = self.rep_levels.as_mut() {
+                            rep_levels.clear();
+                        }
+                    }
+                    if read_in_chunk < select {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        Ok(builder.finish())
     }
 
     /// Try to read `num_records` of column data into internal buffer.
@@ -797,5 +865,57 @@ mod tests {
                 assert_eq!(actual, expected)
             }
         }
+    }
+
+    #[test]
+    fn test_read_boolean_nullable() {
+        use crate::arrow::array_reader::byte_view_array::ByteViewArrayColumnValueDecoder;
+        use crate::arrow::arrow_reader::selection::RowSelectionCursor;
+        use crate::arrow::buffer::view_buffer::ViewBuffer;
+        use crate::column::reader::decoder::ColumnPredicate;
+        use crate::data_type::ByteArrayType;
+
+        let message_type = "
+        message test_schema {
+          OPTIONAL BYTE_ARRAY leaf (UTF8);
+        }
+        ";
+        let desc = crate::schema::parser::parse_message_type(message_type)
+            .map(|t| Arc::new(SchemaDescriptor::new(Arc::new(t))))
+            .map(|s| s.column(0))
+            .unwrap();
+
+        // data: [Some("a"), None, Some(""), Some("b"), None]
+        // NotEmpty: [true, false, false, true, false]
+        let values = [
+            crate::data_type::ByteArray::from("a"),
+            crate::data_type::ByteArray::from(""),
+            crate::data_type::ByteArray::from("b"),
+        ];
+        let def_levels = [1i16, 0, 1, 1, 0];
+
+        let mut pb = DataPageBuilderImpl::new(desc.clone(), 5, true);
+        pb.add_def_levels(1, &def_levels);
+        pb.add_values::<ByteArrayType>(Encoding::PLAIN, &values);
+        let page = pb.consume();
+
+        let page_reader = InMemoryPageReader::new(vec![page]);
+        let mut record_reader =
+            super::GenericRecordReader::<ViewBuffer, ByteViewArrayColumnValueDecoder>::new(desc);
+        record_reader
+            .set_page_reader(Box::new(page_reader))
+            .unwrap();
+
+        let mut cursor = RowSelectionCursor::All;
+        let bools = record_reader
+            .read_boolean(5, &mut cursor, ColumnPredicate::NotEmpty)
+            .unwrap();
+
+        assert_eq!(bools.len(), 5);
+        assert_eq!(bools.value(0), true); // "a"
+        assert_eq!(bools.value(1), false); // None
+        assert_eq!(bools.value(2), false); // ""
+        assert_eq!(bools.value(3), true); // "b"
+        assert_eq!(bools.value(4), false); // None
     }
 }

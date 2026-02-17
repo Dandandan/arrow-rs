@@ -23,7 +23,8 @@ use bytes::Bytes;
 use crate::arrow::buffer::bit_util::count_set_bits;
 use crate::basic::Encoding;
 use crate::column::reader::decoder::{
-    ColumnLevelDecoder, DefinitionLevelDecoder, DefinitionLevelDecoderImpl,
+    ColumnLevelDecoder, DefinitionLevelBufferTrait, DefinitionLevelDecoder,
+    DefinitionLevelDecoderImpl,
 };
 use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
@@ -52,7 +53,33 @@ pub struct DefinitionLevelBuffer {
     len: usize,
 }
 
+impl DefinitionLevelBufferTrait for DefinitionLevelBuffer {
+    fn nulls(&self) -> &BooleanBufferBuilder {
+        match &self.inner {
+            BufferInner::Full { nulls, .. } => nulls,
+            BufferInner::Mask { nulls } => nulls,
+        }
+    }
+}
+
 impl DefinitionLevelBuffer {
+    pub fn reset(&mut self) {
+        self.len = 0;
+        match &mut self.inner {
+            BufferInner::Full {
+                levels,
+                nulls,
+                max_level: _,
+            } => {
+                levels.clear();
+                nulls.finish(); // Clear the builder
+            }
+            BufferInner::Mask { nulls } => {
+                nulls.finish(); // Clear the builder
+            }
+        }
+    }
+
     pub fn new(desc: &ColumnDescPtr, null_mask_only: bool) -> Self {
         let inner = match null_mask_only {
             true => {
