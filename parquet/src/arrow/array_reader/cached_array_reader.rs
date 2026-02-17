@@ -19,7 +19,9 @@
 
 use crate::arrow::array_reader::row_group_cache::BatchID;
 use crate::arrow::array_reader::{ArrayReader, row_group_cache::RowGroupCache};
+use crate::arrow::arrow_reader::RowSelectionCursor;
 use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
+use crate::column::reader::decoder::ColumnPredicate;
 use crate::errors::Result;
 use arrow_array::{ArrayRef, BooleanArray, new_empty_array};
 use arrow_buffer::BooleanBufferBuilder;
@@ -345,6 +347,15 @@ impl ArrayReader for CachedArrayReader {
 
     fn get_rep_levels(&self) -> Option<&[i16]> {
         None
+    }
+
+    fn read_boolean(
+        &mut self,
+        batch_size: usize,
+        cursor: &mut RowSelectionCursor,
+        predicate: ColumnPredicate,
+    ) -> Result<arrow_buffer::BooleanBuffer> {
+        self.inner.read_boolean(batch_size, cursor, predicate)
     }
 }
 

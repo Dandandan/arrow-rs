@@ -17,9 +17,13 @@
 
 //! Contains column reader API.
 
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use bytes::Bytes;
 
 use super::page::{Page, PageReader};
+use crate::column::reader::decoder::{
+    ColumnPredicate, DefinitionLevelBufferTrait, RepetitionLevelBufferTrait,
+};
 use crate::basic::*;
 use crate::column::reader::decoder::{
     ColumnValueDecoder, ColumnValueDecoderImpl, DefinitionLevelDecoder, DefinitionLevelDecoderImpl,
@@ -30,7 +34,8 @@ use crate::errors::{ParquetError, Result};
 use crate::schema::types::ColumnDescPtr;
 use crate::util::bit_util::{ceil, num_required_bits, read_num_bytes};
 
-pub(crate) mod decoder;
+/// Decoders for column values and levels
+pub mod decoder;
 
 /// Column reader for a Parquet type.
 pub enum ColumnReader {
@@ -165,6 +170,8 @@ where
     R: RepetitionLevelDecoder,
     D: DefinitionLevelDecoder,
     V: ColumnValueDecoder,
+    D::Buffer: DefinitionLevelBufferTrait,
+    R::Buffer: RepetitionLevelBufferTrait,
 {
     pub(crate) fn new_with_decoders(
         descr: ColumnDescPtr,
@@ -183,6 +190,124 @@ where
             values_decoder,
             has_record_delimiter: false,
         }
+    }
+
+    /// Read up to `max_records` whole records, returning the number of complete
+    /// records, non-null values and levels decoded. All levels for a given record
+    /// will be read, i.e. the next repetition level, if any, will be 0
+    ///
+    /// If the max definition level is 0, `def_levels` will be ignored and the number of records,
+    /// non-null values and levels decoded will all be equal, otherwise `def_levels` will be
+    /// populated with the number of levels read, with an error returned if it is `None`.
+    ///
+    /// If the max repetition level is 0, `rep_levels` will be ignored and the number of records
+    /// and levels decoded will both be equal, otherwise `rep_levels` will be populated with
+    /// the number of levels read, with an error returned if it is `None`.
+    ///
+    /// Read up to `max_records` whole records and evaluate the predicate.
+    ///
+    /// # Returns
+    ///
+    /// Returns the number of complete records read, the boolean mask of evaluated values,
+    /// and the number of levels decoded.
+    pub fn read_boolean(
+        &mut self,
+        max_records: usize,
+        mut out_def: Option<&mut D::Buffer>,
+        mut out_rep: Option<&mut R::Buffer>,
+        predicate: ColumnPredicate,
+    ) -> Result<(usize, BooleanBuffer, usize)> {
+        let mut total_records_read = 0;
+        let mut total_levels_read = 0;
+        let mut builder = BooleanBufferBuilder::new(0);
+
+        while total_records_read < max_records && self.has_next()? {
+            let remaining_records = max_records - total_records_read;
+            let remaining_levels = self.num_buffered_values - self.num_decoded_values;
+
+            let (records_read, levels_read, start_rep) =
+                match (self.rep_level_decoder.as_mut(), out_rep.as_mut()) {
+                    (Some(reader), Some(out)) => {
+                        let start_rep = out.levels().len();
+                        let (mut records_read, levels_read) =
+                            reader.read_rep_levels(out, remaining_records, remaining_levels)?;
+
+                        if levels_read == remaining_levels && self.has_record_delimiter {
+                            records_read += reader.flush_partial() as usize;
+                        }
+                        (records_read, levels_read, start_rep)
+                    }
+                    (None, _) => {
+                        let min = remaining_records.min(remaining_levels);
+                        (min, min, 0)
+                    }
+                    (Some(_), None) => return Err(general_err!("must specify repetition levels")),
+                };
+
+            let level_bits = match (self.def_level_decoder.as_mut(), out_def.as_mut()) {
+                (Some(decoder), Some(out)) => {
+                    let start_levels = out.nulls().len();
+                    let (values_read, levels_read_def) = decoder.read_def_levels(out, levels_read)?;
+
+                    if levels_read_def != levels_read {
+                        return Err(general_err!(
+                            "insufficient definition levels read from column - expected {levels_read}, got {levels_read_def}"
+                        ));
+                    }
+
+                    let values_bool = self.values_decoder.read_boolean(values_read, predicate)?;
+
+                    if values_read == levels_read {
+                        values_bool
+                    } else {
+                        let mut values_iter = values_bool.iter();
+                        let mut bits = BooleanBufferBuilder::new(levels_read);
+                        for i in 0..levels_read {
+                            if crate::util::bit_util::get_bit(
+                                out.nulls().as_slice(),
+                                start_levels + i,
+                            ) {
+                                bits.append(values_iter.next().unwrap());
+                            } else {
+                                bits.append(false);
+                            }
+                        }
+                        bits.finish()
+                    }
+                }
+                (None, _) => self.values_decoder.read_boolean(levels_read, predicate)?,
+                (Some(_), None) => return Err(general_err!("must specify definition levels")),
+            };
+
+            // Aggregate level_bits into builder (one bit per record)
+            if let (Some(_), Some(out)) = (self.rep_level_decoder.as_ref(), out_rep.as_mut()) {
+                let rep_levels = out.levels();
+                let mut level_idx = 0;
+                for _ in 0..records_read {
+                    let mut record_match = false;
+                    // A record ends when the next repetition level is 0
+                    // The first level of a batch might not be 0 if it's a continuation of a record
+                    // But GenericColumnReader::read_records (and our read_boolean) reads WHOLE records.
+                    // So the first level in a batch SHOULD be 0 UNLESS we have partial.
+                    // Actually, rep_levels[start_rep + level_idx] is 0 for a new record.
+                    record_match |= level_bits.value(level_idx);
+                    level_idx += 1;
+                    while level_idx < levels_read && rep_levels[start_rep + level_idx] > 0 {
+                        record_match |= level_bits.value(level_idx);
+                        level_idx += 1;
+                    }
+                    builder.append(record_match);
+                }
+            } else {
+                builder.append_buffer(&level_bits);
+            }
+
+            self.num_decoded_values += levels_read;
+            total_records_read += records_read;
+            total_levels_read += levels_read;
+        }
+
+        Ok((total_records_read, builder.finish(), total_levels_read))
     }
 
     /// Read up to `max_records` whole records, returning the number of complete

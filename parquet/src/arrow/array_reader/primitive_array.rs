@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::arrow::array_reader::{ArrayReader, read_records, skip_records};
+use crate::arrow::arrow_reader::RowSelectionCursor;
 use crate::arrow::record_reader::RecordReader;
+use crate::column::reader::decoder::ColumnPredicate;
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::Type as PhysicalType;
 use crate::column::page::PageIterator;
@@ -493,6 +495,21 @@ where
 
     fn skip_records(&mut self, num_records: usize) -> Result<usize> {
         skip_records(&mut self.record_reader, self.pages.as_mut(), num_records)
+    }
+
+    fn read_boolean(
+        &mut self,
+        batch_size: usize,
+        cursor: &mut RowSelectionCursor,
+        predicate: ColumnPredicate,
+    ) -> Result<arrow_buffer::BooleanBuffer> {
+        super::read_boolean(
+            &mut self.record_reader,
+            self.pages.as_mut(),
+            batch_size,
+            cursor,
+            predicate,
+        )
     }
 
     fn get_def_levels(&self) -> Option<&[i16]> {

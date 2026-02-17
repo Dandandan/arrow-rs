@@ -44,6 +44,11 @@ pub trait ArrowPredicate: Send + 'static {
     /// * `true`:the row should be returned
     /// * `false` or `null`: the row should not be returned
     fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError>;
+
+    /// Returns the [`ColumnPredicate`] if this predicate can be pushed down to the decoder.
+    fn as_column_predicate(&self) -> Option<crate::column::reader::decoder::ColumnPredicate> {
+        None
+    }
 }
 
 /// An [`ArrowPredicate`] created from an [`FnMut`] and a [`ProjectionMask`]

@@ -16,13 +16,15 @@
 // under the License.
 
 use crate::arrow::array_reader::{ArrayReader, read_records, skip_records};
+use crate::arrow::arrow_reader::RowSelectionCursor;
 use crate::arrow::buffer::view_buffer::ViewBuffer;
 use crate::arrow::decoder::{DeltaByteArrayDecoder, DictIndexDecoder};
+use arrow_buffer::BooleanBuffer;
+use crate::column::reader::decoder::{ColumnPredicate, ColumnValueDecoder};
 use crate::arrow::record_reader::GenericRecordReader;
 use crate::arrow::schema::parquet_to_arrow_field;
 use crate::basic::{ConvertedType, Encoding};
 use crate::column::page::PageIterator;
-use crate::column::reader::decoder::ColumnValueDecoder;
 use crate::data_type::Int32Type;
 use crate::encodings::decoding::{Decoder, DeltaBitPackDecoder};
 use crate::errors::{ParquetError, Result};
@@ -117,6 +119,21 @@ impl ArrayReader for ByteViewArrayReader {
         skip_records(&mut self.record_reader, self.pages.as_mut(), num_records)
     }
 
+    fn read_boolean(
+        &mut self,
+        batch_size: usize,
+        cursor: &mut RowSelectionCursor,
+        predicate: ColumnPredicate,
+    ) -> Result<BooleanBuffer> {
+        super::read_boolean(
+            &mut self.record_reader,
+            self.pages.as_mut(),
+            batch_size,
+            cursor,
+            predicate,
+        )
+    }
+
     fn get_def_levels(&self) -> Option<&[i16]> {
         self.def_levels_buffer.as_deref()
     }
@@ -127,7 +144,7 @@ impl ArrayReader for ByteViewArrayReader {
 }
 
 /// A [`ColumnValueDecoder`] for variable length byte arrays
-struct ByteViewArrayColumnValueDecoder {
+pub(crate) struct ByteViewArrayColumnValueDecoder {
     dict: Option<ViewBuffer>,
     decoder: Option<ByteViewArrayDecoder>,
     validate_utf8: bool,
@@ -208,6 +225,19 @@ impl ColumnValueDecoder for ByteViewArrayColumnValueDecoder {
 
         decoder.skip(num_values, self.dict.as_ref())
     }
+
+    fn read_boolean(
+        &mut self,
+        num_values: usize,
+        predicate: ColumnPredicate,
+    ) -> Result<BooleanBuffer> {
+        let decoder = self
+            .decoder
+            .as_mut()
+            .ok_or_else(|| general_err!("no decoder set"))?;
+
+        decoder.read_boolean(num_values, predicate, self.dict.as_ref())
+    }
 }
 
 /// A generic decoder from uncompressed parquet value data to [`ViewBuffer`]
@@ -285,6 +315,25 @@ impl ByteViewArrayDecoder {
             }
             ByteViewArrayDecoder::DeltaLength(d) => d.skip(len),
             ByteViewArrayDecoder::DeltaByteArray(d) => d.skip(len),
+        }
+    }
+
+    /// Read up to `len` values and evaluate the predicate
+    pub fn read_boolean(
+        &mut self,
+        len: usize,
+        predicate: ColumnPredicate,
+        dict: Option<&ViewBuffer>,
+    ) -> Result<BooleanBuffer> {
+        match self {
+            ByteViewArrayDecoder::Plain(d) => d.read_boolean(len, predicate),
+            ByteViewArrayDecoder::Dictionary(d) => {
+                let dict = dict
+                    .ok_or_else(|| general_err!("dictionary required for dictionary encoding"))?;
+                d.read_boolean(dict, len, predicate)
+            }
+            ByteViewArrayDecoder::DeltaLength(d) => d.read_boolean(len, predicate),
+            ByteViewArrayDecoder::DeltaByteArray(d) => d.read_boolean(len, predicate),
         }
     }
 }
@@ -419,6 +468,33 @@ impl ByteViewArrayDecoderPlain {
         self.max_remaining_values -= skip;
         Ok(skip)
     }
+
+    pub fn read_boolean(
+        &mut self,
+        len: usize,
+        predicate: ColumnPredicate,
+    ) -> Result<BooleanBuffer> {
+        let to_read = len.min(self.max_remaining_values);
+        let mut buffer = vec![0u8; (to_read + 7) / 8];
+        let mut read = 0;
+        let buf: &[u8] = self.buf.as_ref();
+
+        while self.offset < self.buf.len() && read != to_read {
+            if self.offset + 4 > buf.len() {
+                return Err(ParquetError::EOF("eof decoding byte array (Plain)".into()));
+            }
+            let len_bytes: [u8; 4] = buf[self.offset..self.offset + 4].try_into().unwrap();
+            let string_len = u32::from_le_bytes(len_bytes) as usize;
+            if predicate.evaluate_length(string_len) {
+                buffer[read / 8] |= 1 << (read % 8);
+            }
+            self.offset += 4 + string_len;
+            read += 1;
+        }
+        self.max_remaining_values -= read;
+        assert_eq!(read, to_read, "PlainDecoder: read {} values, expected {}", read, to_read);
+        Ok(BooleanBuffer::new(buffer.into(), 0, read))
+    }
 }
 
 pub struct ByteViewArrayDecoderDictionary {
@@ -502,6 +578,37 @@ impl ByteViewArrayDecoderDictionary {
             return Ok(0);
         }
         self.decoder.skip(to_skip)
+    }
+
+    fn read_boolean(
+        &mut self,
+        dict: &ViewBuffer,
+        len: usize,
+        predicate: ColumnPredicate,
+    ) -> Result<BooleanBuffer> {
+        if dict.is_empty() || len == 0 {
+            let mut res = Vec::with_capacity(len);
+            res.resize(len, false);
+            return Ok(BooleanBuffer::from(res));
+        }
+        let mut buffer = vec![0u8; (len + 7) / 8];
+        let mut read = 0;
+        self.decoder.read(len, |keys| {
+            for k in keys {
+                let view = dict
+                    .views
+                    .get(*k as usize)
+                    .ok_or_else(|| general_err!("invalid key={} for dictionary", *k))?;
+                let string_len = *view as u32 as usize;
+                if predicate.evaluate_length(string_len) {
+                    buffer[read / 8] |= 1 << (read % 8);
+                }
+                read += 1;
+            }
+            Ok(())
+        })?;
+        assert_eq!(read, len, "DictionaryDecoder: read {} values, expected {}", read, len);
+        Ok(BooleanBuffer::new(buffer.into(), 0, read))
     }
 }
 
@@ -593,6 +700,29 @@ impl ByteViewArrayDecoderDeltaLength {
         self.length_offset += to_skip;
         Ok(to_skip)
     }
+
+    fn read_boolean(
+        &mut self,
+        len: usize,
+        predicate: ColumnPredicate,
+    ) -> Result<BooleanBuffer> {
+        let to_read = len.min(self.lengths.len() - self.length_offset);
+        let mut buffer = vec![0u8; (to_read + 7) / 8];
+
+        let src_lengths = &self.lengths[self.length_offset..self.length_offset + to_read];
+
+        for (i, length) in src_lengths.iter().enumerate() {
+            if predicate.evaluate_length(*length as usize) {
+                buffer[i / 8] |= 1 << (i % 8);
+            }
+            self.data_offset += *length as usize;
+        }
+
+        self.length_offset += to_read;
+        assert_eq!(to_read, len, "DeltaLengthDecoder: read {} values, expected {}", to_read, len);
+
+        Ok(BooleanBuffer::new(buffer.into(), 0, to_read))
+    }
 }
 
 /// Decoder from [`Encoding::DELTA_BYTE_ARRAY`] to [`ViewBuffer`]
@@ -680,6 +810,24 @@ impl ByteViewArrayDecoderDelta {
     fn skip(&mut self, to_skip: usize) -> Result<usize> {
         self.decoder.skip(to_skip)
     }
+
+    fn read_boolean(
+        &mut self,
+        len: usize,
+        predicate: ColumnPredicate,
+    ) -> Result<BooleanBuffer> {
+        let mut buffer = vec![0u8; (len + 7) / 8];
+        let mut read = 0;
+        self.decoder.read(len, |bytes| {
+            if predicate.evaluate_length(bytes.len()) {
+                buffer[read / 8] |= 1 << (read % 8);
+            }
+            read += 1;
+            Ok(())
+        })?;
+        assert_eq!(read, len, "DeltaByteArrayDecoder: read {} values, expected {}", read, len);
+        Ok(BooleanBuffer::new(buffer.into(), 0, read))
+    }
 }
 
 #[cfg(test)]
@@ -703,30 +851,30 @@ mod tests {
     #[test]
     fn test_byte_array_string_view_decoder() {
         let (pages, encoded_dictionary) =
-            byte_array_all_encodings(vec!["hello", "world", "large payload over 12 bytes", "b"]);
+            byte_array_all_encodings(vec!["hello", "world", "large payload over 12 bytes", "b", ""]);
 
         let column_desc = utf8_column();
         let mut decoder = ByteViewArrayColumnValueDecoder::new(&column_desc);
 
         decoder
-            .set_dict(encoded_dictionary, 4, Encoding::RLE_DICTIONARY, false)
+            .set_dict(encoded_dictionary.clone(), 5, Encoding::RLE_DICTIONARY, false)
             .unwrap();
 
         for (encoding, page) in pages {
             let mut output = ViewBuffer::default();
-            decoder.set_data(encoding, page, 4, Some(4)).unwrap();
+            decoder.set_data(encoding, page.clone(), 5, Some(5)).unwrap();
 
             assert_eq!(decoder.read(&mut output, 1).unwrap(), 1);
             assert_eq!(decoder.read(&mut output, 1).unwrap(), 1);
-            assert_eq!(decoder.read(&mut output, 2).unwrap(), 2);
-            assert_eq!(decoder.read(&mut output, 4).unwrap(), 0);
+            assert_eq!(decoder.read(&mut output, 3).unwrap(), 3);
+            assert_eq!(decoder.read(&mut output, 5).unwrap(), 0);
 
-            assert_eq!(output.views.len(), 4);
+            assert_eq!(output.views.len(), 5);
 
-            let valid = [false, false, true, true, false, true, true, false, false];
+            let valid = [false, false, true, true, false, true, true, true, false, false];
             let valid_buffer = Buffer::from_iter(valid.iter().cloned());
 
-            output.pad_nulls(0, 4, valid.len(), valid_buffer.as_slice());
+            output.pad_nulls(0, 5, valid.len(), valid_buffer.as_slice());
             let array = output.into_array(Some(valid_buffer), &ArrowType::Utf8View);
             let strings = array.as_any().downcast_ref::<StringViewArray>().unwrap();
 
@@ -740,10 +888,36 @@ mod tests {
                     None,
                     Some("large payload over 12 bytes"),
                     Some("b"),
+                    Some(""),
                     None,
                     None,
                 ]
             );
+
+            // Test read_boolean
+            let mut decoder = ByteViewArrayColumnValueDecoder::new(&column_desc);
+            decoder.set_data(encoding, page, 5, Some(5)).unwrap();
+            if matches!(
+                encoding,
+                Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY
+            ) {
+                decoder
+                    .set_dict(
+                        encoded_dictionary.clone(),
+                        5,
+                        Encoding::RLE_DICTIONARY,
+                        false,
+                    )
+                    .unwrap();
+            }
+
+            let bools = decoder.read_boolean(5, ColumnPredicate::NotEmpty).unwrap();
+            assert_eq!(bools.len(), 5);
+            assert_eq!(bools.value(0), true); // hello
+            assert_eq!(bools.value(1), true); // world
+            assert_eq!(bools.value(2), true); // large
+            assert_eq!(bools.value(3), true); // b
+            assert_eq!(bools.value(4), false); // ""
         }
     }
 
