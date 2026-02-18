@@ -400,6 +400,20 @@ impl ProjectionMask {
         }
     }
 
+    /// Returns true if this mask is a subset of the `other` mask
+    ///
+    /// i.e. if a column is included in this mask, it is also included in the `other` mask
+    pub fn is_subset_of(&self, other: &Self) -> bool {
+        match (self.mask.as_ref(), other.mask.as_ref()) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(a), Some(b)) => {
+                debug_assert_eq!(a.len(), b.len());
+                a.iter().zip(b.iter()).all(|(&a, &b)| !a || b)
+            }
+        }
+    }
+
     /// Intersect two projection masks
     ///
     /// Example:

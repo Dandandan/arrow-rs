@@ -20,6 +20,7 @@
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType as ArrowType, FieldRef, Schema, SchemaRef};
+use arrow_select::concat::concat_batches;
 use arrow_select::filter::filter_record_batch;
 pub use filter::{ArrowPredicate, ArrowPredicateFn, RowFilter};
 pub use selection::{RowSelection, RowSelectionCursor, RowSelectionPolicy, RowSelector};
@@ -396,6 +397,109 @@ impl<T> ArrowReaderBuilder<T> {
             max_predicate_cache_size,
             ..self
         }
+    }
+
+    /// Returns true if the given predicate can be moved to post-filtering.
+    ///
+    /// This is safe if the predicate's required columns are a subset of the
+    /// final projection and the root-leaf structure matches.
+    fn is_post_filter_candidate(
+        predicate: &dyn ArrowPredicate,
+        final_projection: &ProjectionMask,
+        schema: &SchemaDescriptor,
+    ) -> bool {
+        let p = predicate.projection();
+
+        if !p.is_subset_of(final_projection) {
+            return false;
+        }
+
+        let num_roots = schema.root_schema().get_fields().len();
+        let mut root_has_diff = vec![false; num_roots];
+        let mut root_has_included = vec![false; num_roots];
+
+        for i in 0..schema.num_columns() {
+            let r = schema.get_column_root_idx(i);
+            if p.leaf_included(i) != final_projection.leaf_included(i) {
+                root_has_diff[r] = true;
+            }
+            if p.leaf_included(i) {
+                root_has_included[r] = true;
+            }
+        }
+
+        for r in 0..num_roots {
+            if root_has_included[r] && root_has_diff[r] {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Returns true if pushing down the predicate provides IO benefits.
+    ///
+    /// It provides benefit if there's at least one column in the final projection
+    /// that hasn't been read yet and isn't required by the current predicate.
+    fn is_io_beneficial(
+        predicate: &dyn ArrowPredicate,
+        final_projection: &ProjectionMask,
+        pushed_down_projection: &ProjectionMask,
+        schema: &SchemaDescriptor,
+    ) -> bool {
+        let p = predicate.projection();
+
+        // Beneficial if final_projection \ (pushed_down_projection U p) is not empty
+        for i in 0..schema.num_columns() {
+            if final_projection.leaf_included(i)
+                && !pushed_down_projection.leaf_included(i)
+                && !p.leaf_included(i)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns the column indices of the required columns for the given predicate
+    /// in the final projected schema.
+    fn get_projection_indices(
+        predicate: &dyn ArrowPredicate,
+        final_projection: &ProjectionMask,
+        schema: &SchemaDescriptor,
+    ) -> Vec<usize> {
+        let p = predicate.projection();
+
+        let num_roots = schema.root_schema().get_fields().len();
+        let mut root_included_in_p = vec![false; num_roots];
+        for i in 0..schema.num_columns() {
+            if final_projection.leaf_included(i) {
+                root_included_in_p[schema.get_column_root_idx(i)] = true;
+            }
+        }
+
+        let mut root_to_batch_index = vec![0; num_roots];
+        let mut batch_index = 0;
+        for r in 0..num_roots {
+            if root_included_in_p[r] {
+                root_to_batch_index[r] = batch_index;
+                batch_index += 1;
+            }
+        }
+
+        let mut predicate_roots = vec![false; num_roots];
+        for i in 0..schema.num_columns() {
+            if p.leaf_included(i) {
+                predicate_roots[schema.get_column_root_idx(i)] = true;
+            }
+        }
+
+        let mut indices = vec![];
+        for r in 0..num_roots {
+            if predicate_roots[r] {
+                indices.push(root_to_batch_index[r]);
+            }
+        }
+        indices
     }
 }
 
@@ -1028,7 +1132,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             batch_size,
             row_groups,
             projection,
-            mut filter,
+            filter,
             selection,
             row_selection_policy,
             limit,
@@ -1045,7 +1149,7 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
 
         let reader = ReaderRowGroups {
             reader: Arc::new(input.0),
-            metadata,
+            metadata: metadata.clone(),
             row_groups,
         };
 
@@ -1053,16 +1157,38 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             .with_selection(selection)
             .with_row_selection_policy(row_selection_policy);
 
+        let mut post_filter = Vec::new();
+        let parquet_schema = metadata.file_metadata().schema_descr();
+        let mut pushed_down_projection = ProjectionMask::none(parquet_schema.num_columns());
+
         // Update selection based on any filters
-        if let Some(filter) = filter.as_mut() {
-            for predicate in filter.predicates.iter_mut() {
+        if let Some(filter) = filter {
+            // Optimization: if there's no limit/offset, some predicates can be moved to post-filtering.
+            // Pushing down filters with limit/offset requires them to be part of the ReadPlan.
+            let can_optimize = limit.is_none() && offset.is_none();
+
+            for mut predicate in filter.predicates {
                 // break early if we have ruled out all rows
                 if !plan_builder.selects_any() {
                     break;
                 }
 
-                let mut cache_projection = predicate.projection().clone();
-                cache_projection.intersect(&projection);
+                if can_optimize
+                    && Self::is_post_filter_candidate(predicate.as_ref(), &projection, parquet_schema)
+                    && !Self::is_io_beneficial(
+                        predicate.as_ref(),
+                        &projection,
+                        &pushed_down_projection,
+                        parquet_schema,
+                    )
+                {
+                    let indices =
+                        Self::get_projection_indices(predicate.as_ref(), &projection, parquet_schema);
+                    post_filter.push((predicate, indices));
+                    continue;
+                }
+
+                pushed_down_projection.union(predicate.projection());
 
                 let array_reader = ArrayReaderBuilder::new(&reader, &metrics)
                     .with_parquet_metadata(&reader.metadata)
@@ -1083,7 +1209,9 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             .build_limited()
             .build();
 
-        Ok(ParquetRecordBatchReader::new(array_reader, read_plan))
+        let mut reader = ParquetRecordBatchReader::new(array_reader, read_plan);
+        reader.post_filter = post_filter;
+        Ok(reader)
     }
 }
 
@@ -1185,6 +1313,8 @@ pub struct ParquetRecordBatchReader {
     array_reader: Box<dyn ArrayReader>,
     schema: SchemaRef,
     read_plan: ReadPlan,
+    post_filter: Vec<(Box<dyn ArrowPredicate>, Vec<usize>)>,
+    remainder: Option<RecordBatch>,
 }
 
 impl Debug for ParquetRecordBatchReader {
@@ -1193,6 +1323,7 @@ impl Debug for ParquetRecordBatchReader {
             .field("array_reader", &"...")
             .field("schema", &self.schema)
             .field("read_plan", &self.read_plan)
+            .field("post_filter", &self.post_filter.len())
             .finish()
     }
 }
@@ -1214,6 +1345,57 @@ impl ParquetRecordBatchReader {
     /// Returns `Result<Option<..>>` rather than `Option<Result<..>>` to
     /// simplify error handling with `?`
     fn next_inner(&mut self) -> Result<Option<RecordBatch>> {
+        if self.post_filter.is_empty() && self.remainder.is_none() {
+            return self.next_inner_impl();
+        }
+        let batch_size = self.batch_size();
+        let mut batches = Vec::new();
+        let mut rows_collected = 0;
+
+        if let Some(remainder) = self.remainder.take() {
+            rows_collected += remainder.num_rows();
+            batches.push(remainder);
+        }
+
+        while rows_collected < batch_size {
+            let res = self.next_inner_impl()?;
+            match res {
+                Some(mut batch) => {
+                    if !self.post_filter.is_empty() {
+                        for (predicate, projection) in &mut self.post_filter {
+                            let p_batch = batch.project(projection)?;
+                            let mask = predicate.evaluate(p_batch)?;
+                            batch = filter_record_batch(&batch, &mask)?;
+                            if batch.num_rows() == 0 {
+                                break;
+                            }
+                        }
+                    }
+
+                    if batch.num_rows() > 0 {
+                        rows_collected += batch.num_rows();
+                        batches.push(batch);
+                    }
+                }
+                None => break,
+            }
+        }
+
+        if batches.is_empty() {
+            return Ok(None);
+        }
+
+        let combined = concat_batches(&self.schema, &batches)?;
+        if combined.num_rows() > batch_size {
+            let result = combined.slice(0, batch_size);
+            self.remainder = Some(combined.slice(batch_size, combined.num_rows() - batch_size));
+            Ok(Some(result))
+        } else {
+            Ok(Some(combined))
+        }
+    }
+
+    fn next_inner_impl(&mut self) -> Result<Option<RecordBatch>> {
         let mut read_records = 0;
         let batch_size = self.batch_size();
         if batch_size == 0 {
@@ -1391,6 +1573,8 @@ impl ParquetRecordBatchReader {
             array_reader,
             schema: Arc::new(Schema::new(levels.fields.clone())),
             read_plan,
+            post_filter: Vec::new(),
+            remainder: None,
         })
     }
 
@@ -1407,6 +1591,8 @@ impl ParquetRecordBatchReader {
             array_reader,
             schema: Arc::new(schema),
             read_plan,
+            post_filter: Vec::new(),
+            remainder: None,
         }
     }
 
