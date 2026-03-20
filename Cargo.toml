@@ -28,6 +28,7 @@ members = [
     "arrow-data",
     "arrow-flight",
     "arrow-flight/gen",
+    "arrow-gpu",
     "arrow-integration-test",
     "arrow-integration-testing",
     "arrow-ipc",
@@ -87,6 +88,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 arrow = { version = "57.1.0", path = "./arrow", default-features = false }
 arrow-arith = { version = "57.1.0", path = "./arrow-arith" }
+arrow-gpu = { version = "57.1.0", path = "./arrow-gpu" }
 arrow-array = { version = "57.1.0", path = "./arrow-array" }
 arrow-buffer = { version = "57.1.0", path = "./arrow-buffer" }
 arrow-cast = { version = "57.1.0", path = "./arrow-cast" }
